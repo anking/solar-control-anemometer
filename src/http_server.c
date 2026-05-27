@@ -9,6 +9,7 @@
 #include "wifi_config.h"
 #include "anemometer.h"
 #include "mqtt_bridge.h"
+#include "led_status.h"
 #include "config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -421,6 +422,46 @@ static esp_err_t api_mqtt_delete_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"configured\":false,\"connected\":false}");
 }
 
+// ---- LED mode ---------------------------------------------------------------
+
+static esp_err_t api_led_get_handler(httpd_req_t *req)
+{
+    led_mode_t m = led_status_get_mode();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"mode\":\"%s\"}", led_status_mode_name(m));
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t api_led_post_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body"); return ESP_FAIL; }
+
+    char mode_str[16] = {0};
+    json_extract_str(body, "mode", mode_str, sizeof(mode_str));
+
+    led_mode_t mode;
+    if      (strcmp(mode_str, "errors") == 0) mode = LED_MODE_ERRORS_ONLY;
+    else if (strcmp(mode_str, "off")    == 0) mode = LED_MODE_OFF;
+    else if (strcmp(mode_str, "debug")  == 0) mode = LED_MODE_DEBUG;
+    else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be errors|off|debug");
+        return ESP_FAIL;
+    }
+
+    if (led_status_set_mode(mode) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
+        return ESP_FAIL;
+    }
+
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"mode\":\"%s\"}", led_status_mode_name(mode));
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, resp);
+}
+
 // ---- Restart ----------------------------------------------------------------
 
 static void reboot_task(void *arg)
@@ -498,6 +539,8 @@ esp_err_t http_server_start(void)
         { .uri = "/api/mqtt",             .method = HTTP_GET,    .handler = api_mqtt_get_handler },
         { .uri = "/api/mqtt",             .method = HTTP_POST,   .handler = api_mqtt_post_handler },
         { .uri = "/api/mqtt",             .method = HTTP_DELETE, .handler = api_mqtt_delete_handler },
+        { .uri = "/api/led",              .method = HTTP_GET,    .handler = api_led_get_handler },
+        { .uri = "/api/led",              .method = HTTP_POST,   .handler = api_led_post_handler },
         { .uri = "/api/restart",          .method = HTTP_POST,   .handler = api_restart_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

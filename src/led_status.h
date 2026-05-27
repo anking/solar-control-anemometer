@@ -5,19 +5,33 @@
 #include "esp_err.h"
 #include "config.h"
 
-// Single onboard LED (GPIO 8 on the C3 SuperMini, active LOW). The same LED
-// indicates WiFi state — anemometer state is implicit (the sensor either
-// produces pulses or it doesn't, and the dashboard shows that directly).
+// WiFi state hints, fed from wifi_manager. The LED task interprets these
+// together with sensor staleness and the user-selected mode below.
 typedef enum {
-    LED_STATUS_WIFI_CONNECTED,      // Solid ON
-    LED_STATUS_WIFI_CONNECTING,     // Slow blink (1s)
-    LED_STATUS_WIFI_RETRYING,       // Fast blink (200ms)
-    LED_STATUS_WIFI_DISCONNECTED,   // OFF
-    LED_STATUS_WIFI_OFF             // OFF
+    LED_STATUS_WIFI_CONNECTED,      // STA is up
+    LED_STATUS_WIFI_CONNECTING,     // first connect attempt
+    LED_STATUS_WIFI_RETRYING,       // retrying after failure
+    LED_STATUS_WIFI_DISCONNECTED,   // gave up — STA configured but unreachable
+    LED_STATUS_WIFI_OFF             // initial, or AP-only (use set_ap_active)
 } led_wifi_status_t;
 
-esp_err_t led_status_init(void);
-void led_status_set_wifi(led_wifi_status_t status);
-void led_status_set(bool on);
+// User-selectable LED behavior. ERRORS_ONLY is the default (battery-friendly).
+typedef enum {
+    LED_MODE_ERRORS_ONLY = 0,
+    LED_MODE_OFF         = 1,
+    LED_MODE_DEBUG       = 2,
+} led_mode_t;
+
+esp_err_t  led_status_init(void);
+
+void       led_status_set_wifi(led_wifi_status_t status);
+void       led_status_set_ap_active(bool active);
+
+led_mode_t led_status_get_mode(void);
+esp_err_t  led_status_set_mode(led_mode_t mode);
+const char *led_status_mode_name(led_mode_t mode);
+
+// Direct GPIO control (for bring-up only — overwritten by the task next tick).
+void       led_status_set(bool on);
 
 #endif // LED_STATUS_H

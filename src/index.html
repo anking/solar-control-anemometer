@@ -233,6 +233,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       <button class="btn btn-danger" onclick="restartDevice()">Restart</button>
     </div>
   </div>
+
+  <div class="card">
+    <div class="card-title">LED behavior</div>
+    <p class="muted" style="margin-bottom:10px">
+      <b>Errors only</b> (default, battery-friendly): off when everything's fine, brief blink for WiFi/sensor faults.
+      <b>Off</b>: never lights up. <b>Debug</b>: solid on when WiFi connected (original behavior).
+    </p>
+    <div class="btn-row" id="led-modes">
+      <button class="btn" data-mode="errors">Errors only</button>
+      <button class="btn" data-mode="off">Off</button>
+      <button class="btn" data-mode="debug">Debug</button>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -492,7 +505,34 @@ async function refreshSystem() {
     $('sys-heap-min').textContent = s.min_free_heap.toLocaleString();
     $('sensor-gpio').textContent = 'GPIO ' + s.sensor_gpio;
   } catch(e) {}
+  refreshLed();
 }
+
+async function refreshLed() {
+  try {
+    const r = await fetch('/api/led');
+    if (!r.ok) return;
+    const s = await r.json();
+    document.querySelectorAll('#led-modes .btn').forEach(b => {
+      b.classList.toggle('btn-primary', b.dataset.mode === s.mode);
+    });
+  } catch(e) {}
+}
+
+async function setLedMode(mode) {
+  try {
+    const r = await fetch('/api/led', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode})
+    });
+    if (r.ok) { toast('LED mode: ' + mode, 'success'); refreshLed(); }
+    else toast('Save failed', 'error');
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+document.querySelectorAll('#led-modes .btn').forEach(b => {
+  b.onclick = () => setLedMode(b.dataset.mode);
+});
 
 async function restartDevice() {
   if (!confirm('Restart the device?')) return;

@@ -91,6 +91,7 @@ static void wifi_manager_stop_ap(void)
     s_ap_active = false;
     g_wifi_status.ap_active  = false;
     g_wifi_status.ap_clients = 0;
+    led_status_set_ap_active(false);
 
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) {
@@ -324,6 +325,7 @@ esp_err_t wifi_manager_start(const char *ssid, const char *password)
     s_ap_active              = true;
     g_wifi_status.ap_active  = true;
     g_wifi_status.ap_clients = 0;
+    led_status_set_ap_active(true);
 
     esp_netif_ip_info_t ip_info;
     if (esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
