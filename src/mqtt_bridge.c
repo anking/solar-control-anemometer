@@ -150,16 +150,18 @@ void mqtt_bridge_publish_reading(const anemometer_reading_t *r)
     char topic[64];
     snprintf(topic, sizeof(topic), "anemometers/%s/wind", s_mac_str);
 
-    char buf[256];
+    char buf[320];
     int len = snprintf(buf, sizeof(buf),
-        "{\"hz\":%.2f,\"hz_avg\":%.2f,"
+        "{\"voltage_v\":%.3f,\"raw_mv\":%d,\"peak_mv\":%d,\"saturated\":%s,"
         "\"mph\":%.2f,\"kmh\":%.2f,"
         "\"mph_avg\":%.2f,\"kmh_avg\":%.2f,"
-        "\"gust_mph\":%.2f,\"mph_per_hz\":%.3f,"
-        "\"pulses\":%lu}",
-        r->hz, r->hz_avg, r->wind_mph, r->wind_kmh,
-        r->wind_mph_avg, r->wind_kmh_avg, r->gust_mph,
-        r->mph_per_hz, (unsigned long)r->total_pulses);
+        "\"gust_mph\":%.2f,"
+        "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d,"
+        "\"samples\":%lu}",
+        r->voltage_v, r->raw_mv, r->peak_mv, r->saturated ? "true" : "false",
+        r->wind_mph, r->wind_kmh, r->wind_mph_avg, r->wind_kmh_avg, r->gust_mph,
+        r->mph_per_volt, r->zero_offset_mv,
+        (unsigned long)r->sample_count);
 
     int msg_id = esp_mqtt_client_publish(s_client, topic, buf, len, 0, 0);
     if (msg_id >= 0) {

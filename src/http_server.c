@@ -273,17 +273,21 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     anemometer_reading_t r;
     anemometer_get(&r);
 
-    char buf[384];
+    char buf[448];
     snprintf(buf, sizeof(buf),
-        "{\"valid\":%s,\"hz\":%.2f,\"hz_avg\":%.2f,"
+        "{\"valid\":%s,\"voltage_v\":%.3f,\"raw_mv\":%d,\"peak_mv\":%d,"
+        "\"saturated\":%s,"
         "\"mph\":%.2f,\"kmh\":%.2f,"
         "\"mph_avg\":%.2f,\"kmh_avg\":%.2f,"
-        "\"gust_mph\":%.2f,\"mph_per_hz\":%.3f,"
-        "\"pulses\":%lu}",
+        "\"gust_mph\":%.2f,"
+        "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d,"
+        "\"samples\":%lu}",
         r.valid ? "true" : "false",
-        r.hz, r.hz_avg, r.wind_mph, r.wind_kmh,
-        r.wind_mph_avg, r.wind_kmh_avg, r.gust_mph,
-        r.mph_per_hz, (unsigned long)r.total_pulses);
+        r.voltage_v, r.raw_mv, r.peak_mv,
+        r.saturated ? "true" : "false",
+        r.wind_mph, r.wind_kmh, r.wind_mph_avg, r.wind_kmh_avg, r.gust_mph,
+        r.mph_per_volt, r.zero_offset_mv,
+        (unsigned long)r.sample_count);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
@@ -291,24 +295,59 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 
 static esp_err_t api_calibrate_handler(httpd_req_t *req)
 {
-    char body[128] = {0};
+    char body[160] = {0};
     int len = httpd_req_recv(req, body, sizeof(body) - 1);
     if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body"); return ESP_FAIL; }
 
-    float mph_per_hz = json_extract_float(body, "mph_per_hz", 0.0f);
-    if (mph_per_hz <= 0.0f) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mph_per_hz must be > 0");
+    bool changed = false;
+
+    // Optional field: mph_per_volt
+    float mph_per_volt = json_extract_float(body, "mph_per_volt", -1.0f);
+    if (mph_per_volt > 0.0f) {
+        if (anemometer_set_mph_per_volt(mph_per_volt) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid mph_per_volt");
+            return ESP_FAIL;
+        }
+        changed = true;
+    }
+
+    // Optional field: zero_offset_mv
+    int zero_mv = json_extract_int(body, "zero_offset_mv", -1);
+    if (zero_mv >= 0) {
+        if (anemometer_set_zero_offset_mv(zero_mv) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid zero_offset_mv");
+            return ESP_FAIL;
+        }
+        changed = true;
+    }
+
+    if (!changed) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Provide mph_per_volt and/or zero_offset_mv");
         return ESP_FAIL;
     }
 
-    esp_err_t err = anemometer_set_mph_per_hz(mph_per_hz);
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d}",
+             anemometer_get_mph_per_volt(), anemometer_get_zero_offset_mv());
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, resp);
+}
+
+static esp_err_t api_capture_zero_handler(httpd_req_t *req)
+{
+    esp_err_t err = anemometer_capture_zero();
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No reading yet");
+        return ESP_FAIL;
+    }
     if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid value");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Capture failed");
         return ESP_FAIL;
     }
-
     char resp[64];
-    snprintf(resp, sizeof(resp), "{\"mph_per_hz\":%.3f}", mph_per_hz);
+    snprintf(resp, sizeof(resp), "{\"zero_offset_mv\":%d}",
+             anemometer_get_zero_offset_mv());
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, resp);
 }
@@ -454,6 +493,7 @@ esp_err_t http_server_start(void)
         { .uri = "/api/system",           .method = HTTP_GET,    .handler = system_info_handler },
         { .uri = "/api/status",           .method = HTTP_GET,    .handler = api_status_handler },
         { .uri = "/api/calibrate",        .method = HTTP_POST,   .handler = api_calibrate_handler },
+        { .uri = "/api/capture-zero",     .method = HTTP_POST,   .handler = api_capture_zero_handler },
         { .uri = "/api/reset-gust",       .method = HTTP_POST,   .handler = api_reset_gust_handler },
         { .uri = "/api/mqtt",             .method = HTTP_GET,    .handler = api_mqtt_get_handler },
         { .uri = "/api/mqtt",             .method = HTTP_POST,   .handler = api_mqtt_post_handler },

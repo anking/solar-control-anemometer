@@ -3,77 +3,105 @@
 #include "nvs_store.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "anemometer";
 
-static volatile uint32_t s_pulse_count = 0;
-static volatile int64_t  s_last_edge_us = 0;
-static volatile uint32_t s_total_pulses = 0;
-static portMUX_TYPE      s_isr_mux = portMUX_INITIALIZER_UNLOCKED;
+static adc_oneshot_unit_handle_t s_adc = NULL;
+static adc_cali_handle_t         s_cali = NULL;
+static bool                      s_cali_ok = false;
 
 static SemaphoreHandle_t s_mutex = NULL;
 static anemometer_reading_t s_reading = {0};
-static float s_mph_per_hz = ANEMOMETER_DEFAULT_MPH_PER_HZ;
-static float s_window_hz[ANEMOMETER_AVG_SAMPLES] = {0};
+
+static float s_mph_per_volt   = ANEMOMETER_DEFAULT_MPH_PER_VOLT;
+static int   s_zero_offset_mv = ANEMOMETER_DEFAULT_ZERO_OFFSET_MV;
+
+static float s_window_mph[ANEMOMETER_AVG_SAMPLES] = {0};
 static int   s_window_idx = 0;
 static int   s_window_filled = 0;
 
-static void IRAM_ATTR pulse_isr(void *arg)
+static uint32_t s_sample_count = 0;
+
+static inline int raw_to_mv(int raw)
 {
-    int64_t now = esp_timer_get_time();
-    if ((now - s_last_edge_us) < ANEMOMETER_DEBOUNCE_US) return;
-    s_last_edge_us = now;
-    s_pulse_count++;
-    s_total_pulses++;
+    int mv = 0;
+    if (s_cali_ok) {
+        adc_cali_raw_to_voltage(s_cali, raw, &mv);
+    } else {
+        // Fallback: linear approximation if calibration scheme isn't available.
+        // 12-bit ADC, DB_12 attenuation, ~3100 mV full-scale.
+        mv = (raw * 3100) / 4095;
+    }
+    return mv;
 }
 
 static void sampler_task(void *arg)
 {
-    const TickType_t period = pdMS_TO_TICKS(ANEMOMETER_SAMPLE_INTERVAL_MS);
+    const TickType_t sample_period  = pdMS_TO_TICKS(1000 / ANEMOMETER_OVERSAMPLE_HZ);
+    const int        samples_per_s  = ANEMOMETER_OVERSAMPLE_HZ;
+    int    in_window = 0;
+    int    sum_mv = 0;
+    int    peak_mv = 0;
     TickType_t last = xTaskGetTickCount();
 
     while (1) {
-        vTaskDelayUntil(&last, period);
+        vTaskDelayUntil(&last, sample_period);
 
-        // Snapshot + reset counter atomically wrt ISR.
-        portENTER_CRITICAL(&s_isr_mux);
-        uint32_t pulses = s_pulse_count;
-        s_pulse_count = 0;
-        portEXIT_CRITICAL(&s_isr_mux);
+        int raw = 0;
+        esp_err_t err = adc_oneshot_read(s_adc, ANEMOMETER_ADC_CHANNEL, &raw);
+        if (err != ESP_OK) continue;
+        int mv = raw_to_mv(raw);
+        s_sample_count++;
 
-        float seconds = ANEMOMETER_SAMPLE_INTERVAL_MS / 1000.0f;
-        float hz = (float)pulses / seconds;
+        sum_mv += mv;
+        if (mv > peak_mv) peak_mv = mv;
+        in_window++;
 
-        // Update rolling window.
-        s_window_hz[s_window_idx] = hz;
-        s_window_idx = (s_window_idx + 1) % ANEMOMETER_AVG_SAMPLES;
-        if (s_window_filled < ANEMOMETER_AVG_SAMPLES) s_window_filled++;
+        if (in_window >= samples_per_s) {
+            int avg_mv = sum_mv / in_window;
+            int captured_peak = peak_mv;
+            in_window = 0;
+            sum_mv = 0;
+            peak_mv = 0;
 
-        float sum = 0.0f;
-        for (int i = 0; i < s_window_filled; i++) sum += s_window_hz[i];
-        float hz_avg = sum / (float)s_window_filled;
+            float voltage = avg_mv / 1000.0f;
+            float zero_v  = s_zero_offset_mv / 1000.0f;
+            float mph     = (voltage - zero_v) * s_mph_per_volt;
+            if (mph < 0.0f) mph = 0.0f;
 
-        float mph     = hz     * s_mph_per_hz;
-        float mph_avg = hz_avg * s_mph_per_hz;
+            // Update rolling window.
+            s_window_mph[s_window_idx] = mph;
+            s_window_idx = (s_window_idx + 1) % ANEMOMETER_AVG_SAMPLES;
+            if (s_window_filled < ANEMOMETER_AVG_SAMPLES) s_window_filled++;
+            float sum = 0.0f;
+            for (int i = 0; i < s_window_filled; i++) sum += s_window_mph[i];
+            float mph_avg = sum / (float)s_window_filled;
 
-        xSemaphoreTake(s_mutex, portMAX_DELAY);
-        s_reading.valid          = true;
-        s_reading.hz             = hz;
-        s_reading.hz_avg         = hz_avg;
-        s_reading.wind_mph       = mph;
-        s_reading.wind_kmh       = mph * 1.60934f;
-        s_reading.wind_mph_avg   = mph_avg;
-        s_reading.wind_kmh_avg   = mph_avg * 1.60934f;
-        if (mph > s_reading.gust_mph) s_reading.gust_mph = mph;
-        s_reading.mph_per_hz     = s_mph_per_hz;
-        s_reading.total_pulses   = s_total_pulses;
-        s_reading.last_sample_us = esp_timer_get_time();
-        xSemaphoreGive(s_mutex);
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_reading.valid          = true;
+            s_reading.voltage_v      = voltage;
+            s_reading.raw_mv         = avg_mv;
+            s_reading.peak_mv        = captured_peak;
+            s_reading.saturated      = captured_peak >= ANEMOMETER_SATURATION_MV;
+            s_reading.wind_mph       = mph;
+            s_reading.wind_kmh       = mph * 1.60934f;
+            s_reading.wind_mph_avg   = mph_avg;
+            s_reading.wind_kmh_avg   = mph_avg * 1.60934f;
+            if (mph > s_reading.gust_mph) s_reading.gust_mph = mph;
+            s_reading.mph_per_volt   = s_mph_per_volt;
+            s_reading.zero_offset_mv = s_zero_offset_mv;
+            s_reading.sample_count   = s_sample_count;
+            s_reading.last_sample_us = esp_timer_get_time();
+            xSemaphoreGive(s_mutex);
+        }
     }
 }
 
@@ -84,42 +112,57 @@ esp_err_t anemometer_init(void)
 
     // Load saved calibration.
     uint16_t stored;
-    if (nvs_store_get_u16(NVS_NS_ANEMOMETER, "mph_per_hz_x1k", &stored) == ESP_OK) {
-        s_mph_per_hz = (float)stored / 1000.0f;
-        ESP_LOGI(TAG, "Loaded calibration: %.3f mph per Hz", s_mph_per_hz);
+    if (nvs_store_get_u16(NVS_NS_ANEMOMETER, "mph_per_v_x100", &stored) == ESP_OK) {
+        s_mph_per_volt = (float)stored / 100.0f;
+        ESP_LOGI(TAG, "Loaded slope: %.2f mph/V", s_mph_per_volt);
     } else {
-        ESP_LOGI(TAG, "Using default calibration: %.3f mph per Hz", s_mph_per_hz);
+        ESP_LOGI(TAG, "Using default slope: %.2f mph/V", s_mph_per_volt);
+    }
+    if (nvs_store_get_u16(NVS_NS_ANEMOMETER, "zero_off_mv", &stored) == ESP_OK) {
+        s_zero_offset_mv = (int)stored;
+        ESP_LOGI(TAG, "Loaded zero offset: %d mV", s_zero_offset_mv);
     }
 
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << ANEMOMETER_GPIO),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,
+    // ADC1 oneshot init.
+    adc_oneshot_unit_init_cfg_t init_cfg = { .unit_id = ANEMOMETER_ADC_UNIT };
+    esp_err_t err = adc_oneshot_new_unit(&init_cfg, &s_adc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "adc_oneshot_new_unit failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    esp_err_t err = gpio_config(&io);
+    err = adc_oneshot_config_channel(s_adc, ANEMOMETER_ADC_CHANNEL, &chan_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "GPIO config failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "adc_oneshot_config_channel failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "ISR service install failed: %s", esp_err_to_name(err));
-        return err;
+    // Curve-fitting calibration (supported on ESP32-C3).
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = ANEMOMETER_ADC_UNIT,
+        .chan     = ANEMOMETER_ADC_CHANNEL,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali) == ESP_OK) {
+        s_cali_ok = true;
+        ESP_LOGI(TAG, "ADC calibration: curve-fitting");
+    } else {
+        ESP_LOGW(TAG, "ADC calibration unavailable, using linear approximation");
     }
+#else
+    ESP_LOGW(TAG, "ADC curve-fitting not compiled in, using linear approximation");
+#endif
 
-    err = gpio_isr_handler_add(ANEMOMETER_GPIO, pulse_isr, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ISR add failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    xTaskCreate(sampler_task, "anemo_smp", 4096, NULL, 5, NULL);
 
-    xTaskCreate(sampler_task, "anemo_smp", 3072, NULL, 5, NULL);
-
-    ESP_LOGI(TAG, "Anemometer ready on GPIO%d (pull-up, falling-edge, debounce %dus)",
-             ANEMOMETER_GPIO, ANEMOMETER_DEBOUNCE_US);
+    ESP_LOGI(TAG, "ADC sampler ready on GPIO%d (ADC1 ch%d) — %d Hz oversample → 1 Hz",
+             ANEMOMETER_GPIO, (int)ANEMOMETER_ADC_CHANNEL, ANEMOMETER_OVERSAMPLE_HZ);
     return ESP_OK;
 }
 
@@ -131,20 +174,49 @@ void anemometer_get(anemometer_reading_t *out)
     xSemaphoreGive(s_mutex);
 }
 
-float anemometer_get_mph_per_hz(void)
+float anemometer_get_mph_per_volt(void)
 {
-    return s_mph_per_hz;
+    return s_mph_per_volt;
 }
 
-esp_err_t anemometer_set_mph_per_hz(float mph_per_hz)
+esp_err_t anemometer_set_mph_per_volt(float mph_per_volt)
 {
-    if (mph_per_hz <= 0.0f || mph_per_hz > 50.0f) return ESP_ERR_INVALID_ARG;
-    s_mph_per_hz = mph_per_hz;
-    uint16_t stored = (uint16_t)(mph_per_hz * 1000.0f + 0.5f);
-    esp_err_t err = nvs_store_set_u16(NVS_NS_ANEMOMETER, "mph_per_hz_x1k", stored);
-    ESP_LOGI(TAG, "Calibration set: %.3f mph per Hz (%s)",
-             mph_per_hz, err == ESP_OK ? "saved" : "save failed");
+    if (mph_per_volt <= 0.0f || mph_per_volt > 200.0f) return ESP_ERR_INVALID_ARG;
+    s_mph_per_volt = mph_per_volt;
+    uint16_t stored = (uint16_t)(mph_per_volt * 100.0f + 0.5f);
+    esp_err_t err = nvs_store_set_u16(NVS_NS_ANEMOMETER, "mph_per_v_x100", stored);
+    ESP_LOGI(TAG, "Slope set: %.2f mph/V (%s)",
+             mph_per_volt, err == ESP_OK ? "saved" : "save failed");
     return err;
+}
+
+int anemometer_get_zero_offset_mv(void)
+{
+    return s_zero_offset_mv;
+}
+
+esp_err_t anemometer_set_zero_offset_mv(int offset_mv)
+{
+    if (offset_mv < 0 || offset_mv > 3000) return ESP_ERR_INVALID_ARG;
+    s_zero_offset_mv = offset_mv;
+    esp_err_t err = nvs_store_set_u16(NVS_NS_ANEMOMETER, "zero_off_mv", (uint16_t)offset_mv);
+    ESP_LOGI(TAG, "Zero offset set: %d mV (%s)",
+             offset_mv, err == ESP_OK ? "saved" : "save failed");
+    return err;
+}
+
+esp_err_t anemometer_capture_zero(void)
+{
+    if (!s_mutex) return ESP_FAIL;
+    int mv;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!s_reading.valid) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    mv = s_reading.raw_mv;
+    xSemaphoreGive(s_mutex);
+    return anemometer_set_zero_offset_mv(mv);
 }
 
 void anemometer_reset_gust(void)

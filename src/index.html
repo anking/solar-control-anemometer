@@ -117,34 +117,46 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
         <div class="wind-cell-value"><span id="wind-gust">--</span><span class="wind-cell-unit">mph</span></div>
       </div>
       <div class="wind-cell">
-        <div class="wind-cell-label">Pulse Rate</div>
-        <div class="wind-cell-value"><span id="wind-hz">--</span><span class="wind-cell-unit">Hz</span></div>
+        <div class="wind-cell-label">Voltage</div>
+        <div class="wind-cell-value"><span id="wind-volts">--</span><span class="wind-cell-unit">V</span></div>
       </div>
+    </div>
+    <div id="saturation-warn" style="display:none;margin-top:14px;padding:8px;border-radius:6px;background:rgba(239,68,68,.15);border:1px solid var(--red);font-size:12px;color:var(--red);text-align:left">
+      ⚠ ADC saturated — peak voltage exceeded ~3.0 V. Real wind speed may be higher than shown.
     </div>
   </div>
 
   <div class="card">
     <div class="card-title">Calibration</div>
-    <p class="muted" style="margin-bottom:10px">Wind speed = pulses/sec × <b>mph_per_hz</b>. Tune this to match your anemometer's spec sheet. Default 1.492 is the Davis convention (1 Hz ≈ 2.4 km/h).</p>
+    <p class="muted" style="margin-bottom:10px">Wind speed = (voltage − <b>zero offset</b>) × <b>mph_per_volt</b>. The Jeanoko spec is 0–32 m/s over 0–3.8 V, giving ~18.83 mph/V — but real sensors drift, so calibrate against a hand anemometer.</p>
     <div class="field">
-      <label>mph per Hz</label>
-      <input class="input" id="calib-input" type="number" step="0.001" min="0.001" max="50">
+      <label>mph per Volt</label>
+      <input class="input" id="calib-slope" type="number" step="0.01" min="0.01" max="200">
     </div>
     <div class="preset-row">
-      <div class="preset" data-val="1.492">Davis 1.492</div>
-      <div class="preset" data-val="1.6">~1.6</div>
-      <div class="preset" data-val="2.4">2.4 (raw km/h/Hz)</div>
+      <div class="preset" data-target="calib-slope" data-val="18.83">Spec 18.83</div>
+      <div class="preset" data-target="calib-slope" data-val="15">15</div>
+      <div class="preset" data-target="calib-slope" data-val="22">22</div>
+    </div>
+    <div class="field" style="margin-top:14px">
+      <label>Zero offset (mV) — voltage at zero wind</label>
+      <input class="input" id="calib-zero" type="number" step="1" min="0" max="3000">
     </div>
     <div class="btn-row">
-      <button class="btn btn-primary" onclick="saveCalibration()">Save</button>
+      <button class="btn btn-primary" onclick="saveCalibration()">Save calibration</button>
+      <button class="btn" onclick="captureZero()" title="Snapshot the current voltage as the new zero offset">Capture zero (now)</button>
       <button class="btn" onclick="resetGust()">Reset Gust</button>
     </div>
   </div>
 
   <div class="card">
     <div class="card-title">Diagnostics</div>
-    <div class="metric"><span class="metric-label">Pulses since boot</span><span class="metric-value" id="pulses">--</span></div>
-    <div class="metric"><span class="metric-label">Active calibration</span><span class="metric-value"><span id="active-calib">--</span><span class="metric-unit">mph/Hz</span></span></div>
+    <div class="metric"><span class="metric-label">Live voltage (1 s avg)</span><span class="metric-value"><span id="diag-volts">--</span><span class="metric-unit">V</span></span></div>
+    <div class="metric"><span class="metric-label">Last sample (mV)</span><span class="metric-value" id="diag-rawmv">--</span></div>
+    <div class="metric"><span class="metric-label">Peak in window (mV)</span><span class="metric-value" id="diag-peakmv">--</span></div>
+    <div class="metric"><span class="metric-label">Active slope</span><span class="metric-value"><span id="active-slope">--</span><span class="metric-unit">mph/V</span></span></div>
+    <div class="metric"><span class="metric-label">Active zero offset</span><span class="metric-value"><span id="active-zero">--</span><span class="metric-unit">mV</span></span></div>
+    <div class="metric"><span class="metric-label">ADC samples since boot</span><span class="metric-value" id="diag-samples">--</span></div>
     <div class="metric"><span class="metric-label">Sensor GPIO</span><span class="metric-value" id="sensor-gpio">--</span></div>
   </div>
 </div>
@@ -292,18 +304,24 @@ function applyStatus(s) {
   if (s.valid === false) {
     $('wind-mph').textContent = '--';
     $('wind-kmh').textContent = '--';
-  } else {
-    $('wind-mph').textContent = s.mph.toFixed(1);
-    $('wind-kmh').textContent = s.kmh.toFixed(1);
-    $('wind-avg').textContent = s.mph_avg.toFixed(1);
-    $('wind-gust').textContent = s.gust_mph.toFixed(1);
-    $('wind-hz').textContent = s.hz.toFixed(2);
-    $('pulses').textContent = s.pulses;
-    $('active-calib').textContent = s.mph_per_hz.toFixed(3);
-    // Gauge fill: 0..60 mph maps to 0..251.3 dash length.
-    const pct = Math.max(0, Math.min(1, s.mph / 60));
-    $('gauge-fg').setAttribute('stroke-dashoffset', 251.3 * (1 - pct));
+    return;
   }
+  $('wind-mph').textContent = s.mph.toFixed(1);
+  $('wind-kmh').textContent = s.kmh.toFixed(1);
+  $('wind-avg').textContent = s.mph_avg.toFixed(1);
+  $('wind-gust').textContent = s.gust_mph.toFixed(1);
+  $('wind-volts').textContent = s.voltage_v.toFixed(2);
+
+  $('diag-volts').textContent = s.voltage_v.toFixed(3);
+  $('diag-rawmv').textContent = s.raw_mv;
+  $('diag-peakmv').textContent = s.peak_mv;
+  $('active-slope').textContent = s.mph_per_volt.toFixed(2);
+  $('active-zero').textContent = s.zero_offset_mv;
+  $('diag-samples').textContent = s.samples.toLocaleString();
+  $('saturation-warn').style.display = s.saturated ? 'block' : 'none';
+
+  const pct = Math.max(0, Math.min(1, s.mph / 60));
+  $('gauge-fg').setAttribute('stroke-dashoffset', 251.3 * (1 - pct));
 }
 
 async function poll() {
@@ -315,15 +333,37 @@ async function poll() {
 
 // Calibration
 async function saveCalibration() {
-  const v = parseFloat($('calib-input').value);
-  if (!v || v <= 0) { toast('Enter a positive number', 'error'); return; }
+  const slope = parseFloat($('calib-slope').value);
+  const zero  = parseInt($('calib-zero').value);
+  const body = {};
+  if (slope > 0) body.mph_per_volt = slope;
+  if (!isNaN(zero) && zero >= 0) body.zero_offset_mv = zero;
+  if (Object.keys(body).length === 0) {
+    toast('Enter a slope or zero offset', 'error');
+    return;
+  }
   try {
     const r = await fetch('/api/calibrate', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({mph_per_hz: v})
+      body: JSON.stringify(body)
     });
     if (r.ok) toast('Calibration saved', 'success'); else toast('Save failed', 'error');
   } catch(e) { toast('Save failed', 'error'); }
+}
+
+async function captureZero() {
+  if (!confirm('Snapshot the current voltage as the new zero offset?\nMake sure the cups are completely still.')) return;
+  try {
+    const r = await fetch('/api/capture-zero', {method:'POST'});
+    if (r.ok) {
+      const j = await r.json();
+      $('calib-zero').value = j.zero_offset_mv;
+      toast(`Zero captured: ${j.zero_offset_mv} mV`, 'success');
+    } else {
+      const j = await r.json().catch(() => ({}));
+      toast(j.error || 'Capture failed', 'error');
+    }
+  } catch(e) { toast('Capture failed', 'error'); }
 }
 
 async function resetGust() {
@@ -334,7 +374,10 @@ async function resetGust() {
 }
 
 document.querySelectorAll('.preset').forEach(p => {
-  p.onclick = () => { $('calib-input').value = p.dataset.val; };
+  p.onclick = () => {
+    const target = p.dataset.target || 'calib-slope';
+    $(target).value = p.dataset.val;
+  };
 });
 
 // WiFi
@@ -461,19 +504,18 @@ async function restartDevice() {
 
 // Boot
 (async function init() {
-  // Pre-fill calibration from current status
   try {
     const r = await fetch('/api/status');
     if (r.ok) {
       const s = await r.json();
-      $('calib-input').value = s.mph_per_hz.toFixed(3);
+      $('calib-slope').value = s.mph_per_volt.toFixed(2);
+      $('calib-zero').value  = s.zero_offset_mv;
       applyStatus(s);
     }
   } catch(e) {}
   refreshWifi();
   refreshSystem();
   connectWs();
-  // Belt-and-suspenders polling in case WS drops.
   setInterval(poll, 2000);
 })();
 </script>

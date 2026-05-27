@@ -1,40 +1,45 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include "hal/adc_types.h"
+
 // =============================================================================
 // HARDWARE: Teyleten Robot ESP32-C3 SuperMini
 // =============================================================================
-// Pinout note: GPIO 8 has an onboard LED, active-LOW on most SuperMini boards
-// (LED lights when the pin is driven LOW). GPIO 8 is also a strapping pin, so
-// drive it AFTER boot completes (which we do).
+// GPIO 8 has the onboard LED, active-LOW on most SuperMini boards.
 
-// Onboard LED (active LOW)
+// Onboard LED
 #define LED_GPIO              8
 #define LED_ACTIVE_LOW        1
 
-// Anemometer pulse input. The reed/hall switch closes against GND; we enable
-// the internal pull-up so the line idles HIGH and dips LOW on each closure.
-#define ANEMOMETER_GPIO       4
+// Anemometer: passive DC generator (no excitation needed). Signal is connected
+// to GPIO 4 with a 1µF cap to GND for ripple smoothing. GPIO 4 is ADC1_CH4.
+// We use ADC1 only — ADC2 conflicts with WiFi on the C3.
+#define ANEMOMETER_ADC_UNIT    ADC_UNIT_1
+#define ANEMOMETER_ADC_CHANNEL ADC_CHANNEL_4
+#define ANEMOMETER_GPIO        4
 
 // =============================================================================
 // ANEMOMETER CALIBRATION
 // =============================================================================
-// Davis-style cup anemometer convention: 1 closure per revolution, and
-// 2.4 km/h (=1.492 mph) per Hz of rotation.
-//   wind_mph = pulses_per_sec * MPH_PER_HZ
-// Override at runtime via the dashboard if your sensor is different.
-#define ANEMOMETER_DEFAULT_MPH_PER_HZ   1.492f
+// Linear model: wind_mph = max(0, (voltage_v - zero_offset_v) * mph_per_volt)
+//
+// Spec from the seller is 0..3.8 V over 0..32 m/s, giving 18.83 mph per volt.
+// That's a starting guess; field-calibrate from the dashboard against a hand
+// anemometer for real accuracy.
+#define ANEMOMETER_DEFAULT_MPH_PER_VOLT   18.83f
+#define ANEMOMETER_DEFAULT_ZERO_OFFSET_MV 0
 
-// Debounce window for the GPIO ISR. Reed switches bounce ~1 ms typically.
-// At 1.492 mph/Hz, even a 100 mph wind is only ~67 Hz (≈15 ms period), so
-// a 2 ms guard rejects bounce without clipping real pulses.
-#define ANEMOMETER_DEBOUNCE_US          2000
+// Saturation threshold — readings above this can't be trusted (ADC pegged).
+// With ADC_ATTEN_DB_12 the C3 ADC saturates near 3.1 V.
+#define ANEMOMETER_SATURATION_MV          3000
 
-// Sampling window — pulses are counted over this interval and converted to Hz.
-#define ANEMOMETER_SAMPLE_INTERVAL_MS   1000
+// Sampling: oversample the ADC at this rate, average to produce a 1 Hz reading.
+#define ANEMOMETER_OVERSAMPLE_HZ          100
+#define ANEMOMETER_SAMPLE_INTERVAL_MS     1000
 
-// Rolling average length for the dashboard reading (smooths gusts).
-#define ANEMOMETER_AVG_SAMPLES          5
+// Rolling-average length over 1 Hz readings (smooths gusts).
+#define ANEMOMETER_AVG_SAMPLES            5
 
 // =============================================================================
 // FIRMWARE VERSION (injected by version.py at build time)
