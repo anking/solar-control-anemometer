@@ -1,7 +1,9 @@
 #include "mqtt_bridge.h"
 #include "nvs_store.h"
+#include "config.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_app_desc.h"
 #include "mqtt_client.h"
 #include <string.h>
 #include <stdio.h>
@@ -58,6 +60,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         char topic[64];
         snprintf(topic, sizeof(topic), "anemometers/%s/status", s_mac_str);
         esp_mqtt_client_publish(s_client, topic, "{\"online\":true}", 0, 1, 1);
+
+        // Publish device info so the cloud can identify model/firmware/calibration.
+        mqtt_bridge_publish_info();
         break;
     }
     case MQTT_EVENT_DISCONNECTED:
@@ -141,6 +146,35 @@ esp_err_t mqtt_bridge_init(void)
 bool mqtt_bridge_is_connected(void)
 {
     return s_connected;
+}
+
+void mqtt_bridge_publish_info(void)
+{
+    if (!s_connected || !s_client) return;
+
+    char topic[64];
+    snprintf(topic, sizeof(topic), "anemometers/%s/info", s_mac_str);
+
+    // Pull the current calibration; safe to call from any task.
+    anemometer_reading_t r;
+    anemometer_get(&r);
+
+    const char *fw = esp_app_get_description()->version;
+
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"model\":\"esp32-c3-anemometer\",\"firmware\":\"%s\","
+        "\"sensor_gpio\":%d,"
+        "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d}",
+        fw, ANEMOMETER_GPIO,
+        r.mph_per_volt, r.zero_offset_mv);
+
+    int msg_id = esp_mqtt_client_publish(s_client, topic, buf, len, 1, 1);
+    if (msg_id >= 0) {
+        ESP_LOGI(TAG, "Device info published to %s", topic);
+    } else {
+        ESP_LOGW(TAG, "Device info publish failed");
+    }
 }
 
 void mqtt_bridge_publish_reading(const anemometer_reading_t *r)

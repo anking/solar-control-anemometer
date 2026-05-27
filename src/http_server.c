@@ -328,6 +328,9 @@ static esp_err_t api_calibrate_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    // Re-publish info so the cloud picks up the new calibration immediately.
+    mqtt_bridge_publish_info();
+
     char resp[96];
     snprintf(resp, sizeof(resp), "{\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d}",
              anemometer_get_mph_per_volt(), anemometer_get_zero_offset_mv());
@@ -346,6 +349,7 @@ static esp_err_t api_capture_zero_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Capture failed");
         return ESP_FAIL;
     }
+    mqtt_bridge_publish_info();
     char resp[64];
     snprintf(resp, sizeof(resp), "{\"zero_offset_mv\":%d}",
              anemometer_get_zero_offset_mv());

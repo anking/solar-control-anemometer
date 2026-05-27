@@ -43,6 +43,9 @@ static void status_broadcaster_task(void *arg)
         if (len > 0 && len < (int)sizeof(buf)) {
             http_server_ws_broadcast_status(buf, (size_t)len);
         }
+
+        // Push the same reading to MQTT (no-op if not connected).
+        mqtt_bridge_publish_reading(&r);
     }
 }
 

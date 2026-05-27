@@ -11,6 +11,11 @@ bool mqtt_bridge_is_connected(void);
 
 void mqtt_bridge_publish_reading(const anemometer_reading_t *reading);
 
+// Publishes anemometers/{mac}/info (model, firmware, sensor GPIO, calibration).
+// Auto-called on MQTT_EVENT_CONNECTED; expose publicly so the API can re-send
+// after a calibration change.
+void mqtt_bridge_publish_info(void);
+
 esp_err_t mqtt_bridge_configure(const char *host, int port, const char *user, const char *pass);
 esp_err_t mqtt_bridge_disconnect(void);
 esp_err_t mqtt_bridge_clear_config(void);
