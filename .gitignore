@@ -1,0 +1,10 @@
+.pio
+.vscode
+.claude
+managed_components
+dependencies.lock
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+build/
+version.txt

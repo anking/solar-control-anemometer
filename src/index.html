@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anemometer</title>
+<style>
+:root{--bg:#0f1626;--surface:#1a2540;--surface2:#243358;--text:#e8edf5;--dim:#8696b8;--accent:#38bdf8;--green:#22c55e;--red:#ef4444;--orange:#f97316;--yellow:#eab308;--blue:#3b82f6;--purple:#a855f7}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.header{background:var(--surface);padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--surface2);position:sticky;top:0;z-index:50}
+.header h1{font-size:18px;font-weight:600}
+.header-right{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--dim)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--red);display:inline-block}
+.status-dot.connected{background:var(--green)}
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--surface2);background:var(--surface)}
+.tab{padding:12px 18px;cursor:pointer;color:var(--dim);font-size:14px;font-weight:600;border-bottom:2px solid transparent}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab:hover{color:var(--text)}
+.page{max-width:760px;margin:0 auto;padding:16px;display:none}
+.page.active{display:block}
+.card{background:var(--surface);border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid var(--surface2)}
+.card-title{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin-bottom:10px}
+.wind-hero{text-align:center;padding:28px 16px}
+.wind-mph{font-size:96px;font-weight:800;line-height:.95;background:linear-gradient(135deg,var(--accent),var(--blue));-webkit-background-clip:text;background-clip:text;color:transparent;text-shadow:0 0 40px rgba(56,189,248,.2)}
+.wind-mph-unit{font-size:24px;color:var(--dim);font-weight:600;margin-left:8px}
+.wind-kmh{font-size:18px;color:var(--dim);margin-top:8px}
+.wind-secondary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:24px}
+.wind-cell{background:var(--surface2);border-radius:8px;padding:10px 6px;text-align:center}
+.wind-cell-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.wind-cell-value{font-size:18px;font-weight:700;margin-top:2px}
+.wind-cell-unit{font-size:11px;color:var(--dim);margin-left:2px}
+.gauge-wrap{margin:16px auto 0;width:100%;max-width:340px}
+.gauge-svg{width:100%;height:auto;display:block}
+.gauge-bg{fill:none;stroke:var(--surface2);stroke-width:14;stroke-linecap:round}
+.gauge-fg{fill:none;stroke:url(#gaugeGradient);stroke-width:14;stroke-linecap:round;transition:stroke-dashoffset .35s ease}
+.gauge-label{fill:var(--dim);font-size:11px;text-anchor:middle}
+.metric{display:flex;justify-content:space-between;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--surface2)}
+.metric:last-child{border-bottom:none}
+.metric-label{font-size:13px;color:var(--dim)}
+.metric-value{font-size:15px;font-weight:600}
+.metric-unit{font-size:11px;color:var(--dim);margin-left:3px}
+.btn{padding:8px 14px;border:1px solid var(--surface2);border-radius:6px;background:var(--surface2);color:var(--text);cursor:pointer;font-size:13px;font-weight:600;transition:all .15s}
+.btn:hover{border-color:var(--accent)}
+.btn-primary{background:var(--accent);color:#000;border-color:var(--accent)}
+.btn-danger{background:var(--red);color:#fff;border-color:var(--red)}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.input,.select{width:100%;padding:8px 10px;border:1px solid var(--surface2);background:var(--bg);color:var(--text);border-radius:6px;font-size:13px}
+.input:focus,.select:focus{outline:none;border-color:var(--accent)}
+.field{margin-bottom:10px}
+.field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);margin-bottom:4px}
+.networks{margin-top:10px;display:grid;gap:6px}
+.network{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background:var(--surface2);border-radius:6px;cursor:pointer;transition:all .15s}
+.network:hover{border:1px solid var(--accent)}
+.network .ssid{font-weight:600;font-size:13px}
+.network .meta{font-size:11px;color:var(--dim)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--surface2);padding:10px 16px;border-radius:6px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:200}
+.toast.show{opacity:1}
+.toast.error{background:var(--red);color:#fff}
+.toast.success{background:var(--green);color:#000}
+.preset-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.preset{padding:5px 10px;background:var(--surface2);border-radius:5px;font-size:11px;cursor:pointer;color:var(--dim);border:1px solid transparent}
+.preset:hover{border-color:var(--accent);color:var(--text)}
+.muted{color:var(--dim);font-size:12px}
+.stale{opacity:.4}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Anemometer</h1>
+  <div class="header-right">
+    <span id="conn-label">connecting</span>
+    <span class="status-dot" id="conn-dot"></span>
+  </div>
+</div>
+<div class="tabs">
+  <div class="tab active" data-page="wind">Wind</div>
+  <div class="tab" data-page="wifi">WiFi</div>
+  <div class="tab" data-page="mqtt">MQTT</div>
+  <div class="tab" data-page="system">System</div>
+</div>
+
+<!-- WIND PAGE -->
+<div class="page active" id="page-wind">
+  <div class="card wind-hero">
+    <div>
+      <span class="wind-mph" id="wind-mph">--</span>
+      <span class="wind-mph-unit">mph</span>
+    </div>
+    <div class="wind-kmh"><span id="wind-kmh">--</span> km/h</div>
+
+    <div class="gauge-wrap">
+      <svg class="gauge-svg" viewBox="0 0 200 120">
+        <defs>
+          <linearGradient id="gaugeGradient" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="#22c55e"/>
+            <stop offset="50%" stop-color="#eab308"/>
+            <stop offset="100%" stop-color="#ef4444"/>
+          </linearGradient>
+        </defs>
+        <path class="gauge-bg" d="M 20 100 A 80 80 0 0 1 180 100"/>
+        <path class="gauge-fg" id="gauge-fg" d="M 20 100 A 80 80 0 0 1 180 100"
+              stroke-dasharray="251.3" stroke-dashoffset="251.3"/>
+        <text x="20" y="115" class="gauge-label">0</text>
+        <text x="100" y="115" class="gauge-label">30</text>
+        <text x="180" y="115" class="gauge-label">60+</text>
+      </svg>
+    </div>
+
+    <div class="wind-secondary">
+      <div class="wind-cell">
+        <div class="wind-cell-label">Avg</div>
+        <div class="wind-cell-value"><span id="wind-avg">--</span><span class="wind-cell-unit">mph</span></div>
+      </div>
+      <div class="wind-cell">
+        <div class="wind-cell-label">Gust</div>
+        <div class="wind-cell-value"><span id="wind-gust">--</span><span class="wind-cell-unit">mph</span></div>
+      </div>
+      <div class="wind-cell">
+        <div class="wind-cell-label">Pulse Rate</div>
+        <div class="wind-cell-value"><span id="wind-hz">--</span><span class="wind-cell-unit">Hz</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Calibration</div>
+    <p class="muted" style="margin-bottom:10px">Wind speed = pulses/sec × <b>mph_per_hz</b>. Tune this to match your anemometer's spec sheet. Default 1.492 is the Davis convention (1 Hz ≈ 2.4 km/h).</p>
+    <div class="field">
+      <label>mph per Hz</label>
+      <input class="input" id="calib-input" type="number" step="0.001" min="0.001" max="50">
+    </div>
+    <div class="preset-row">
+      <div class="preset" data-val="1.492">Davis 1.492</div>
+      <div class="preset" data-val="1.6">~1.6</div>
+      <div class="preset" data-val="2.4">2.4 (raw km/h/Hz)</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveCalibration()">Save</button>
+      <button class="btn" onclick="resetGust()">Reset Gust</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Diagnostics</div>
+    <div class="metric"><span class="metric-label">Pulses since boot</span><span class="metric-value" id="pulses">--</span></div>
+    <div class="metric"><span class="metric-label">Active calibration</span><span class="metric-value"><span id="active-calib">--</span><span class="metric-unit">mph/Hz</span></span></div>
+    <div class="metric"><span class="metric-label">Sensor GPIO</span><span class="metric-value" id="sensor-gpio">--</span></div>
+  </div>
+</div>
+
+<!-- WIFI PAGE -->
+<div class="page" id="page-wifi">
+  <div class="card">
+    <div class="card-title">Status</div>
+    <div class="metric"><span class="metric-label">Connection</span><span class="metric-value" id="wifi-conn">--</span></div>
+    <div class="metric"><span class="metric-label">SSID</span><span class="metric-value" id="wifi-ssid">--</span></div>
+    <div class="metric"><span class="metric-label">IP</span><span class="metric-value" id="wifi-ip">--</span></div>
+    <div class="metric"><span class="metric-label">RSSI</span><span class="metric-value"><span id="wifi-rssi">--</span><span class="metric-unit">dBm</span></span></div>
+    <div class="metric"><span class="metric-label">Hostname</span><span class="metric-value" id="wifi-host">--</span></div>
+    <div class="metric"><span class="metric-label">AP fallback</span><span class="metric-value" id="wifi-ap">--</span></div>
+    <div class="btn-row">
+      <button class="btn" onclick="loadWifiScan()">Scan</button>
+      <button class="btn btn-danger" onclick="forgetWifi()">Forget</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Connect to network</div>
+    <div class="field">
+      <label>SSID</label>
+      <input class="input" id="wifi-ssid-input" type="text">
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input class="input" id="wifi-pass-input" type="password">
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="connectWifi()">Connect</button>
+    </div>
+    <div class="networks" id="networks"></div>
+  </div>
+</div>
+
+<!-- MQTT PAGE -->
+<div class="page" id="page-mqtt">
+  <div class="card">
+    <div class="card-title">Status</div>
+    <div class="metric"><span class="metric-label">Configured</span><span class="metric-value" id="mqtt-cfg">--</span></div>
+    <div class="metric"><span class="metric-label">Connected</span><span class="metric-value" id="mqtt-conn">--</span></div>
+    <div class="metric"><span class="metric-label">Host</span><span class="metric-value" id="mqtt-host">--</span></div>
+    <div class="metric"><span class="metric-label">Publishes</span><span class="metric-value"><span id="mqtt-pub">--</span> ok / <span id="mqtt-fail">--</span> fail</span></div>
+    <div class="metric"><span class="metric-label">Topic prefix</span><span class="metric-value" style="font-family:monospace;font-size:12px">anemometers/<span id="mqtt-mac">--</span>/</span></div>
+    <div class="metric"><span class="metric-label">Last error</span><span class="metric-value" id="mqtt-err" style="font-size:12px;color:var(--orange)">--</span></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Broker</div>
+    <p class="muted" style="margin-bottom:10px">MQTT is scaffolded but not yet publishing on every reading. Configure here; wiring to publish is a follow-up.</p>
+    <div class="field"><label>Host</label><input class="input" id="mqtt-host-input" type="text" placeholder="broker.example.com"></div>
+    <div class="field"><label>Port</label><input class="input" id="mqtt-port-input" type="number" value="1883"></div>
+    <div class="field"><label>Username (optional)</label><input class="input" id="mqtt-user-input" type="text"></div>
+    <div class="field"><label>Password (optional)</label><input class="input" id="mqtt-pass-input" type="password"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveMqtt()">Save & Connect</button>
+      <button class="btn btn-danger" onclick="clearMqtt()">Clear</button>
+    </div>
+  </div>
+</div>
+
+<!-- SYSTEM PAGE -->
+<div class="page" id="page-system">
+  <div class="card">
+    <div class="card-title">Device</div>
+    <div class="metric"><span class="metric-label">Firmware</span><span class="metric-value" id="sys-fw">--</span></div>
+    <div class="metric"><span class="metric-label">Git hash</span><span class="metric-value" id="sys-git" style="font-family:monospace;font-size:12px">--</span></div>
+    <div class="metric"><span class="metric-label">IDF version</span><span class="metric-value" id="sys-idf" style="font-family:monospace;font-size:12px">--</span></div>
+    <div class="metric"><span class="metric-label">Board</span><span class="metric-value" id="sys-board">--</span></div>
+    <div class="metric"><span class="metric-label">Free heap</span><span class="metric-value"><span id="sys-heap">--</span><span class="metric-unit">B</span></span></div>
+    <div class="metric"><span class="metric-label">Min free heap</span><span class="metric-value"><span id="sys-heap-min">--</span><span class="metric-unit">B</span></span></div>
+    <div class="btn-row">
+      <button class="btn btn-danger" onclick="restartDevice()">Restart</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let ws = null;
+let wsRetry = 0;
+let staleTimer = null;
+
+function toast(msg, kind='') {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + kind;
+  setTimeout(() => t.className = 'toast', 2200);
+}
+
+// Tabs
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    $('page-' + tab.dataset.page).classList.add('active');
+    if (tab.dataset.page === 'wifi') refreshWifi();
+    if (tab.dataset.page === 'mqtt') refreshMqtt();
+    if (tab.dataset.page === 'system') refreshSystem();
+  };
+});
+
+// Live update via WebSocket; fall back to polling.
+function connectWs() {
+  try {
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    ws.onopen = () => { wsRetry = 0; setConn(true); };
+    ws.onclose = () => {
+      setConn(false);
+      wsRetry++;
+      setTimeout(connectWs, Math.min(wsRetry * 1000, 10000));
+    };
+    ws.onerror = () => { try { ws.close(); } catch(e){} };
+    ws.onmessage = e => {
+      try { applyStatus(JSON.parse(e.data)); } catch(err) {}
+    };
+  } catch (e) {
+    setConn(false);
+    setTimeout(connectWs, 3000);
+  }
+}
+
+function setConn(ok) {
+  $('conn-dot').className = 'status-dot' + (ok ? ' connected' : '');
+  $('conn-label').textContent = ok ? 'live' : 'reconnecting';
+}
+
+function markStale() {
+  document.querySelectorAll('.wind-hero').forEach(e => e.classList.add('stale'));
+}
+function clearStale() {
+  document.querySelectorAll('.wind-hero').forEach(e => e.classList.remove('stale'));
+  clearTimeout(staleTimer);
+  staleTimer = setTimeout(markStale, 8000);
+}
+
+function applyStatus(s) {
+  if (!s) return;
+  clearStale();
+  if (s.valid === false) {
+    $('wind-mph').textContent = '--';
+    $('wind-kmh').textContent = '--';
+  } else {
+    $('wind-mph').textContent = s.mph.toFixed(1);
+    $('wind-kmh').textContent = s.kmh.toFixed(1);
+    $('wind-avg').textContent = s.mph_avg.toFixed(1);
+    $('wind-gust').textContent = s.gust_mph.toFixed(1);
+    $('wind-hz').textContent = s.hz.toFixed(2);
+    $('pulses').textContent = s.pulses;
+    $('active-calib').textContent = s.mph_per_hz.toFixed(3);
+    // Gauge fill: 0..60 mph maps to 0..251.3 dash length.
+    const pct = Math.max(0, Math.min(1, s.mph / 60));
+    $('gauge-fg').setAttribute('stroke-dashoffset', 251.3 * (1 - pct));
+  }
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) applyStatus(await r.json());
+  } catch(e) {}
+}
+
+// Calibration
+async function saveCalibration() {
+  const v = parseFloat($('calib-input').value);
+  if (!v || v <= 0) { toast('Enter a positive number', 'error'); return; }
+  try {
+    const r = await fetch('/api/calibrate', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({mph_per_hz: v})
+    });
+    if (r.ok) toast('Calibration saved', 'success'); else toast('Save failed', 'error');
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+async function resetGust() {
+  try {
+    await fetch('/api/reset-gust', {method:'POST'});
+    toast('Gust reset', 'success');
+  } catch(e) { toast('Reset failed', 'error'); }
+}
+
+document.querySelectorAll('.preset').forEach(p => {
+  p.onclick = () => { $('calib-input').value = p.dataset.val; };
+});
+
+// WiFi
+async function refreshWifi() {
+  try {
+    const r = await fetch('/api/wifi/status');
+    if (!r.ok) return;
+    const s = await r.json();
+    $('wifi-conn').textContent = s.connected ? 'connected' : 'disconnected';
+    $('wifi-ssid').textContent = s.ssid || '—';
+    $('wifi-ip').textContent = s.ip || '—';
+    $('wifi-rssi').textContent = s.rssi || '--';
+    $('wifi-host').textContent = s.hostname ? (s.hostname + '.local') : '—';
+    $('wifi-ap').textContent = s.ap_active ? `${s.ap_ssid} (${s.ap_clients} clients)` : 'off';
+  } catch(e) {}
+}
+
+async function loadWifiScan() {
+  $('networks').innerHTML = '<div class="muted">Scanning…</div>';
+  try {
+    const r = await fetch('/api/wifi/scan');
+    if (!r.ok) { $('networks').innerHTML = '<div class="muted">Scan failed</div>'; return; }
+    const nets = await r.json();
+    if (!nets.length) { $('networks').innerHTML = '<div class="muted">No networks found</div>'; return; }
+    $('networks').innerHTML = nets.map(n => `
+      <div class="network" data-ssid="${n.ssid}">
+        <span class="ssid">${n.ssid}</span>
+        <span class="meta">${n.rssi} dBm · ${n.auth}</span>
+      </div>
+    `).join('');
+    document.querySelectorAll('.network').forEach(el => {
+      el.onclick = () => { $('wifi-ssid-input').value = el.dataset.ssid; };
+    });
+  } catch(e) { $('networks').innerHTML = '<div class="muted">Scan failed</div>'; }
+}
+
+async function connectWifi() {
+  const ssid = $('wifi-ssid-input').value.trim();
+  const password = $('wifi-pass-input').value;
+  if (!ssid) { toast('SSID required', 'error'); return; }
+  try {
+    const r = await fetch('/api/wifi/connect', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ssid, password})
+    });
+    if (r.ok) {
+      toast('Connecting…', 'success');
+      setTimeout(refreshWifi, 3000);
+    } else toast('Connect failed', 'error');
+  } catch(e) { toast('Connect failed', 'error'); }
+}
+
+async function forgetWifi() {
+  if (!confirm('Forget saved WiFi credentials?')) return;
+  await fetch('/api/wifi/forget', {method:'POST'});
+  toast('Forgotten', 'success');
+  setTimeout(refreshWifi, 500);
+}
+
+// MQTT
+async function refreshMqtt() {
+  try {
+    const r = await fetch('/api/mqtt');
+    if (!r.ok) return;
+    const s = await r.json();
+    $('mqtt-cfg').textContent = s.configured ? 'yes' : 'no';
+    $('mqtt-conn').textContent = s.connected ? 'connected' : 'disconnected';
+    $('mqtt-host').textContent = s.host ? `${s.host}:${s.port}` : '—';
+    $('mqtt-pub').textContent = s.pub_ok;
+    $('mqtt-fail').textContent = s.pub_fail;
+    $('mqtt-mac').textContent = s.mac || '—';
+    $('mqtt-err').textContent = s.error || '—';
+    if (s.host) $('mqtt-host-input').value = s.host;
+    if (s.port) $('mqtt-port-input').value = s.port;
+  } catch(e) {}
+}
+
+async function saveMqtt() {
+  const host = $('mqtt-host-input').value.trim();
+  const port = parseInt($('mqtt-port-input').value) || 1883;
+  const username = $('mqtt-user-input').value;
+  const password = $('mqtt-pass-input').value;
+  if (!host) { toast('Host required', 'error'); return; }
+  try {
+    const r = await fetch('/api/mqtt', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({host, port, username, password})
+    });
+    if (r.ok) { toast('Saved', 'success'); setTimeout(refreshMqtt, 1000); }
+    else toast('Save failed', 'error');
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+async function clearMqtt() {
+  if (!confirm('Clear MQTT config?')) return;
+  await fetch('/api/mqtt', {method:'DELETE'});
+  toast('Cleared', 'success');
+  setTimeout(refreshMqtt, 500);
+}
+
+// System
+async function refreshSystem() {
+  try {
+    const r = await fetch('/api/system');
+    if (!r.ok) return;
+    const s = await r.json();
+    $('sys-fw').textContent = s.firmware_version;
+    $('sys-git').textContent = s.git_hash;
+    $('sys-idf').textContent = s.idf_version;
+    $('sys-board').textContent = s.board;
+    $('sys-heap').textContent = s.free_heap.toLocaleString();
+    $('sys-heap-min').textContent = s.min_free_heap.toLocaleString();
+    $('sensor-gpio').textContent = 'GPIO ' + s.sensor_gpio;
+  } catch(e) {}
+}
+
+async function restartDevice() {
+  if (!confirm('Restart the device?')) return;
+  try {
+    await fetch('/api/restart', {method:'POST'});
+    toast('Restarting…', 'success');
+  } catch(e) { toast('Restart failed', 'error'); }
+}
+
+// Boot
+(async function init() {
+  // Pre-fill calibration from current status
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) {
+      const s = await r.json();
+      $('calib-input').value = s.mph_per_hz.toFixed(3);
+      applyStatus(s);
+    }
+  } catch(e) {}
+  refreshWifi();
+  refreshSystem();
+  connectWs();
+  // Belt-and-suspenders polling in case WS drops.
+  setInterval(poll, 2000);
+})();
+</script>
+</body>
+</html>
