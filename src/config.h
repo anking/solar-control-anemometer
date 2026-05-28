@@ -24,10 +24,11 @@
 // =============================================================================
 // Linear model: wind_mph = max(0, (voltage_v - zero_offset_v) * mph_per_volt)
 //
-// Spec from the seller is 0..3.8 V over 0..32 m/s, giving 18.83 mph per volt.
-// That's a starting guess; field-calibrate from the dashboard against a hand
-// anemometer for real accuracy.
-#define ANEMOMETER_DEFAULT_MPH_PER_VOLT   18.83f
+// Default slope of 36 mph/V is the empirical starting point for this build;
+// field-calibrate from the dashboard against a hand anemometer for real
+// accuracy. The sensor's nominal spec is closer to 18.83, but real units
+// drift heavily — measure, don't assume.
+#define ANEMOMETER_DEFAULT_MPH_PER_VOLT   36.0f
 #define ANEMOMETER_DEFAULT_ZERO_OFFSET_MV 0
 
 // Saturation threshold — readings above this can't be trusted (ADC pegged).
@@ -38,8 +39,16 @@
 #define ANEMOMETER_OVERSAMPLE_HZ          100
 #define ANEMOMETER_SAMPLE_INTERVAL_MS     1000
 
-// Rolling-average length over 1 Hz readings (smooths gusts).
-#define ANEMOMETER_AVG_SAMPLES            5
+// ---- WMO-style wind reporting ----------------------------------------------
+// One 1-second sample is appended to a ring buffer every second. From that
+// buffer we derive:
+//   - Sustained mean: arithmetic mean of the last 120 s   (ASOS-style 2-min)
+//   - Gust:           peak 3-second running mean in the   (WMO 8 standard)
+//                     last 600 s
+// 600 floats = 2.4 KB; cost is trivial on the C3.
+#define ANEMOMETER_HISTORY_SECONDS        600   // 10-min rolling window
+#define ANEMOMETER_SUSTAINED_SECONDS      120   //  2-min sustained mean
+#define ANEMOMETER_GUST_AVG_SECONDS       3     //  3-sec gust window
 
 // =============================================================================
 // FIRMWARE VERSION (injected by version.py at build time)

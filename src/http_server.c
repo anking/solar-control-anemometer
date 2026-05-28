@@ -274,19 +274,23 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     anemometer_reading_t r;
     anemometer_get(&r);
 
-    char buf[448];
+    char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"valid\":%s,\"voltage_v\":%.3f,\"raw_mv\":%d,\"peak_mv\":%d,"
         "\"saturated\":%s,"
         "\"mph\":%.2f,\"kmh\":%.2f,"
-        "\"mph_avg\":%.2f,\"kmh_avg\":%.2f,"
+        "\"mph_2min\":%.2f,\"kmh_2min\":%.2f,"
         "\"gust_mph\":%.2f,"
+        "\"window_seconds\":%u,"
         "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d,"
         "\"samples\":%lu}",
         r.valid ? "true" : "false",
         r.voltage_v, r.raw_mv, r.peak_mv,
         r.saturated ? "true" : "false",
-        r.wind_mph, r.wind_kmh, r.wind_mph_avg, r.wind_kmh_avg, r.gust_mph,
+        r.wind_mph, r.wind_kmh,
+        r.wind_mph_2min, r.wind_kmh_2min,
+        r.gust_mph,
+        (unsigned)r.window_seconds,
         r.mph_per_volt, r.zero_offset_mv,
         (unsigned long)r.sample_count);
 
@@ -355,13 +359,6 @@ static esp_err_t api_capture_zero_handler(httpd_req_t *req)
              anemometer_get_zero_offset_mv());
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, resp);
-}
-
-static esp_err_t api_reset_gust_handler(httpd_req_t *req)
-{
-    anemometer_reset_gust();
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
 }
 
 // ---- MQTT -------------------------------------------------------------------
@@ -539,7 +536,6 @@ esp_err_t http_server_start(void)
         { .uri = "/api/status",           .method = HTTP_GET,    .handler = api_status_handler },
         { .uri = "/api/calibrate",        .method = HTTP_POST,   .handler = api_calibrate_handler },
         { .uri = "/api/capture-zero",     .method = HTTP_POST,   .handler = api_capture_zero_handler },
-        { .uri = "/api/reset-gust",       .method = HTTP_POST,   .handler = api_reset_gust_handler },
         { .uri = "/api/mqtt",             .method = HTTP_GET,    .handler = api_mqtt_get_handler },
         { .uri = "/api/mqtt",             .method = HTTP_POST,   .handler = api_mqtt_post_handler },
         { .uri = "/api/mqtt",             .method = HTTP_DELETE, .handler = api_mqtt_delete_handler },

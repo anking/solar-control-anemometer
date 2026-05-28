@@ -87,14 +87,18 @@ static void status_broadcaster_task(void *arg)
             "{\"valid\":%s,\"voltage_v\":%.3f,\"raw_mv\":%d,\"peak_mv\":%d,"
             "\"saturated\":%s,"
             "\"mph\":%.2f,\"kmh\":%.2f,"
-            "\"mph_avg\":%.2f,\"kmh_avg\":%.2f,"
+            "\"mph_2min\":%.2f,\"kmh_2min\":%.2f,"
             "\"gust_mph\":%.2f,"
+            "\"window_seconds\":%u,"
             "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d,"
             "\"samples\":%lu}",
             r.valid ? "true" : "false",
             r.voltage_v, r.raw_mv, r.peak_mv,
             r.saturated ? "true" : "false",
-            r.wind_mph, r.wind_kmh, r.wind_mph_avg, r.wind_kmh_avg, r.gust_mph,
+            r.wind_mph, r.wind_kmh,
+            r.wind_mph_2min, r.wind_kmh_2min,
+            r.gust_mph,
+            (unsigned)r.window_seconds,
             r.mph_per_volt, r.zero_offset_mv,
             (unsigned long)r.sample_count);
 
@@ -189,9 +193,9 @@ void app_main(void)
         wifi_manager_get_status(&s);
         anemometer_reading_t r;
         anemometer_get(&r);
-        ESP_LOGI(TAG, "Heartbeat: wifi=%s ip=%s v=%.3fV wind=%.1f mph (avg %.1f, gust %.1f) heap=%lu",
+        ESP_LOGI(TAG, "Heartbeat: wifi=%s ip=%s v=%.3fV wind=%.1f mph (2-min %.1f, gust %.1f) heap=%lu",
                  s.connected ? "ok" : "down", s.ip,
-                 r.voltage_v, r.wind_mph, r.wind_mph_avg, r.gust_mph,
+                 r.voltage_v, r.wind_mph, r.wind_mph_2min, r.gust_mph,
                  (unsigned long)esp_get_free_heap_size());
     }
 }

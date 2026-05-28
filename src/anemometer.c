@@ -24,11 +24,23 @@ static anemometer_reading_t s_reading = {0};
 static float s_mph_per_volt   = ANEMOMETER_DEFAULT_MPH_PER_VOLT;
 static int   s_zero_offset_mv = ANEMOMETER_DEFAULT_ZERO_OFFSET_MV;
 
-static float s_window_mph[ANEMOMETER_AVG_SAMPLES] = {0};
-static int   s_window_idx = 0;
-static int   s_window_filled = 0;
+// 10-minute ring buffer of 1-Hz samples. Used for both the 2-min sustained
+// mean and the peak 3-sec running mean (gust). s_history_idx is the slot the
+// NEXT sample will go into, so the most-recent sample lives at
+// (s_history_idx - 1) mod N.
+static float    s_history[ANEMOMETER_HISTORY_SECONDS] = {0};
+static uint16_t s_history_idx    = 0;
+static uint16_t s_history_filled = 0;
 
 static uint32_t s_sample_count = 0;
+
+// Read a sample `age` seconds back from the newest. age=0 → newest.
+static inline float hist_age(int age)
+{
+    int idx = ((int)s_history_idx - 1 - age + ANEMOMETER_HISTORY_SECONDS)
+              % ANEMOMETER_HISTORY_SECONDS;
+    return s_history[idx];
+}
 
 static inline int raw_to_mv(int raw)
 {
@@ -77,29 +89,52 @@ static void sampler_task(void *arg)
             float mph     = (voltage - zero_v) * s_mph_per_volt;
             if (mph < 0.0f) mph = 0.0f;
 
-            // Update rolling window.
-            s_window_mph[s_window_idx] = mph;
-            s_window_idx = (s_window_idx + 1) % ANEMOMETER_AVG_SAMPLES;
-            if (s_window_filled < ANEMOMETER_AVG_SAMPLES) s_window_filled++;
-            float sum = 0.0f;
-            for (int i = 0; i < s_window_filled; i++) sum += s_window_mph[i];
-            float mph_avg = sum / (float)s_window_filled;
+            // Push into the 10-minute ring buffer.
+            s_history[s_history_idx] = mph;
+            s_history_idx = (s_history_idx + 1) % ANEMOMETER_HISTORY_SECONDS;
+            if (s_history_filled < ANEMOMETER_HISTORY_SECONDS) s_history_filled++;
+
+            // 2-minute sustained mean (ASOS-style).
+            int sustained_n = (s_history_filled < ANEMOMETER_SUSTAINED_SECONDS)
+                              ? s_history_filled
+                              : ANEMOMETER_SUSTAINED_SECONDS;
+            float sustained_sum = 0.0f;
+            for (int i = 0; i < sustained_n; i++) sustained_sum += hist_age(i);
+            float mph_sustained = (sustained_n > 0)
+                                  ? sustained_sum / (float)sustained_n
+                                  : mph;
+
+            // Peak 3-second running mean over the whole 10-min window (WMO gust).
+            // Naïve O(N) sweep — ~600 ops/s, immaterial on the C3.
+            float gust = mph;  // floor: at least the current 1-s sample
+            if (s_history_filled >= ANEMOMETER_GUST_AVG_SECONDS) {
+                int max_start = s_history_filled - ANEMOMETER_GUST_AVG_SECONDS;
+                for (int start = 0; start <= max_start; start++) {
+                    float s3 = 0.0f;
+                    for (int j = 0; j < ANEMOMETER_GUST_AVG_SECONDS; j++) {
+                        s3 += hist_age(start + j);
+                    }
+                    s3 /= (float)ANEMOMETER_GUST_AVG_SECONDS;
+                    if (s3 > gust) gust = s3;
+                }
+            }
 
             xSemaphoreTake(s_mutex, portMAX_DELAY);
-            s_reading.valid          = true;
-            s_reading.voltage_v      = voltage;
-            s_reading.raw_mv         = avg_mv;
-            s_reading.peak_mv        = captured_peak;
-            s_reading.saturated      = captured_peak >= ANEMOMETER_SATURATION_MV;
-            s_reading.wind_mph       = mph;
-            s_reading.wind_kmh       = mph * 1.60934f;
-            s_reading.wind_mph_avg   = mph_avg;
-            s_reading.wind_kmh_avg   = mph_avg * 1.60934f;
-            if (mph > s_reading.gust_mph) s_reading.gust_mph = mph;
-            s_reading.mph_per_volt   = s_mph_per_volt;
-            s_reading.zero_offset_mv = s_zero_offset_mv;
-            s_reading.sample_count   = s_sample_count;
-            s_reading.last_sample_us = esp_timer_get_time();
+            s_reading.valid           = true;
+            s_reading.voltage_v       = voltage;
+            s_reading.raw_mv          = avg_mv;
+            s_reading.peak_mv         = captured_peak;
+            s_reading.saturated       = captured_peak >= ANEMOMETER_SATURATION_MV;
+            s_reading.wind_mph        = mph;
+            s_reading.wind_kmh        = mph * 1.60934f;
+            s_reading.wind_mph_2min   = mph_sustained;
+            s_reading.wind_kmh_2min   = mph_sustained * 1.60934f;
+            s_reading.gust_mph        = gust;
+            s_reading.mph_per_volt    = s_mph_per_volt;
+            s_reading.zero_offset_mv  = s_zero_offset_mv;
+            s_reading.sample_count    = s_sample_count;
+            s_reading.last_sample_us  = esp_timer_get_time();
+            s_reading.window_seconds  = s_history_filled;
             xSemaphoreGive(s_mutex);
         }
     }
@@ -219,10 +254,3 @@ esp_err_t anemometer_capture_zero(void)
     return anemometer_set_zero_offset_mv(mv);
 }
 
-void anemometer_reset_gust(void)
-{
-    if (!s_mutex) return;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_reading.gust_mph = 0.0f;
-    xSemaphoreGive(s_mutex);
-}

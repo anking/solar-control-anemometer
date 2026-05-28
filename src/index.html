@@ -108,11 +108,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     </div>
 
     <div class="wind-secondary">
-      <div class="wind-cell">
-        <div class="wind-cell-label">Avg</div>
+      <div class="wind-cell" title="2-minute sustained mean (ASOS-style)">
+        <div class="wind-cell-label">2-min avg</div>
         <div class="wind-cell-value"><span id="wind-avg">--</span><span class="wind-cell-unit">mph</span></div>
       </div>
-      <div class="wind-cell">
+      <div class="wind-cell" title="Peak 3-second mean in the last 10 minutes (WMO gust)">
         <div class="wind-cell-label">Gust</div>
         <div class="wind-cell-value"><span id="wind-gust">--</span><span class="wind-cell-unit">mph</span></div>
       </div>
@@ -121,6 +121,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
         <div class="wind-cell-value"><span id="wind-volts">--</span><span class="wind-cell-unit">V</span></div>
       </div>
     </div>
+    <div id="warmup-hint" class="muted" style="display:none;margin-top:10px;font-size:12px;text-align:center">
+      Warming up: 2-min/gust windows still filling (<span id="warmup-progress">0</span>/600 s)
+    </div>
     <div id="saturation-warn" style="display:none;margin-top:14px;padding:8px;border-radius:6px;background:rgba(239,68,68,.15);border:1px solid var(--red);font-size:12px;color:var(--red);text-align:left">
       ⚠ ADC saturated — peak voltage exceeded ~3.0 V. Real wind speed may be higher than shown.
     </div>
@@ -128,14 +131,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 
   <div class="card">
     <div class="card-title">Calibration</div>
-    <p class="muted" style="margin-bottom:10px">Wind speed = (voltage − <b>zero offset</b>) × <b>mph_per_volt</b>. The Jeanoko spec is 0–32 m/s over 0–3.8 V, giving ~18.83 mph/V — but real sensors drift, so calibrate against a hand anemometer.</p>
+    <p class="muted" style="margin-bottom:10px">Wind speed = (voltage − <b>zero offset</b>) × <b>mph_per_volt</b>. Default is 36 mph/V (empirically tuned for this build). The Jeanoko spec implies ~18.83 mph/V, but real sensors drift heavily — calibrate against a hand anemometer.</p>
     <div class="field">
       <label>mph per Volt</label>
       <input class="input" id="calib-slope" type="number" step="0.01" min="0.01" max="200">
     </div>
     <div class="preset-row">
+      <div class="preset" data-target="calib-slope" data-val="36">Default 36</div>
       <div class="preset" data-target="calib-slope" data-val="18.83">Spec 18.83</div>
-      <div class="preset" data-target="calib-slope" data-val="15">15</div>
       <div class="preset" data-target="calib-slope" data-val="22">22</div>
     </div>
     <div class="field" style="margin-top:14px">
@@ -145,7 +148,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     <div class="btn-row">
       <button class="btn btn-primary" onclick="saveCalibration()">Save calibration</button>
       <button class="btn" onclick="captureZero()" title="Snapshot the current voltage as the new zero offset">Capture zero (now)</button>
-      <button class="btn" onclick="resetGust()">Reset Gust</button>
     </div>
   </div>
 
@@ -321,9 +323,18 @@ function applyStatus(s) {
   }
   $('wind-mph').textContent = s.mph.toFixed(1);
   $('wind-kmh').textContent = s.kmh.toFixed(1);
-  $('wind-avg').textContent = s.mph_avg.toFixed(1);
+  $('wind-avg').textContent = s.mph_2min.toFixed(1);
   $('wind-gust').textContent = s.gust_mph.toFixed(1);
   $('wind-volts').textContent = s.voltage_v.toFixed(2);
+
+  // Warm-up hint: 10-min ring buffer isn't full yet.
+  const w = (typeof s.window_seconds === 'number') ? s.window_seconds : 600;
+  if (w < 600) {
+    $('warmup-hint').style.display = 'block';
+    $('warmup-progress').textContent = w;
+  } else {
+    $('warmup-hint').style.display = 'none';
+  }
 
   $('diag-volts').textContent = s.voltage_v.toFixed(3);
   $('diag-rawmv').textContent = s.raw_mv;
@@ -377,13 +388,6 @@ async function captureZero() {
       toast(j.error || 'Capture failed', 'error');
     }
   } catch(e) { toast('Capture failed', 'error'); }
-}
-
-async function resetGust() {
-  try {
-    await fetch('/api/reset-gust', {method:'POST'});
-    toast('Gust reset', 'success');
-  } catch(e) { toast('Reset failed', 'error'); }
 }
 
 document.querySelectorAll('.preset').forEach(p => {

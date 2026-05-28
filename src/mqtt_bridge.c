@@ -184,16 +184,20 @@ void mqtt_bridge_publish_reading(const anemometer_reading_t *r)
     char topic[64];
     snprintf(topic, sizeof(topic), "anemometers/%s/wind", s_mac_str);
 
-    char buf[320];
+    char buf[384];
     int len = snprintf(buf, sizeof(buf),
         "{\"voltage_v\":%.3f,\"raw_mv\":%d,\"peak_mv\":%d,\"saturated\":%s,"
         "\"mph\":%.2f,\"kmh\":%.2f,"
-        "\"mph_avg\":%.2f,\"kmh_avg\":%.2f,"
+        "\"mph_2min\":%.2f,\"kmh_2min\":%.2f,"
         "\"gust_mph\":%.2f,"
+        "\"window_seconds\":%u,"
         "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d,"
         "\"samples\":%lu}",
         r->voltage_v, r->raw_mv, r->peak_mv, r->saturated ? "true" : "false",
-        r->wind_mph, r->wind_kmh, r->wind_mph_avg, r->wind_kmh_avg, r->gust_mph,
+        r->wind_mph, r->wind_kmh,
+        r->wind_mph_2min, r->wind_kmh_2min,
+        r->gust_mph,
+        (unsigned)r->window_seconds,
         r->mph_per_volt, r->zero_offset_mv,
         (unsigned long)r->sample_count);
 
