@@ -21,8 +21,6 @@ static wifi_status_t g_wifi_status = {0};
 static EventGroupHandle_t s_wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
-static const int MAX_RETRY = 5;
-static int s_retry_num = 0;
 static esp_event_handler_instance_t s_instance_any_id = NULL;
 static esp_event_handler_instance_t s_instance_got_ip = NULL;
 static bool s_sntp_started = false;
@@ -35,11 +33,27 @@ static volatile bool s_ap_active       = false;
 static volatile int  s_ap_client_count = 0;
 static TaskHandle_t  s_ap_task_handle  = NULL;
 
+// STA recovery + health monitoring.
+static volatile bool s_has_sta_credentials = false;
+static volatile bool s_ever_connected      = false;
+static TaskHandle_t  s_reconnect_task_handle = NULL;
+static TaskHandle_t  s_watchdog_task_handle  = NULL;
+
 #define AP_INITIAL_KEEP_MS       (5 * 60 * 1000)
 #define AP_POST_CONNECT_KEEP_MS  (5 * 60 * 1000)
 #define AP_CHECK_INTERVAL_MS     5000
 #define AP_MAX_CONNECTIONS       4
 #define AP_CHANNEL               1
+
+// Reconnect backoff: 1s → 2s → 4s → 8s → 16s → 30s (cap).
+#define RECONNECT_BACKOFF_INITIAL_MS  1000
+#define RECONNECT_BACKOFF_MAX_MS      30000
+
+// Watchdog: poll AP info this often. If query keeps failing while we think
+// we're connected, force a reconnect. If we stay offline this long, reboot.
+#define WATCHDOG_CHECK_INTERVAL_MS    30000
+#define WATCHDOG_SILENT_LOSS_FAILS    4              // 4 × 30s = 2 min
+#define WATCHDOG_OFFLINE_REBOOT_MS    (10 * 60 * 1000)
 
 #define MDNS_HOSTNAME_AP   "anemometer"
 
@@ -154,6 +168,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
         case WIFI_EVENT_STA_START:
             led_status_set_wifi(LED_STATUS_WIFI_CONNECTING);
+            // Kick off the very first connection attempt. All subsequent
+            // retries are owned by wifi_reconnect_task — do NOT call
+            // esp_wifi_connect() from the event handler again.
             esp_wifi_connect();
             break;
 
@@ -165,24 +182,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
             ESP_LOGW(TAG, "Wi-Fi disconnected, reason: %d", disc->reason);
 
-            if (s_retry_num < MAX_RETRY) {
-                led_status_set_wifi(LED_STATUS_WIFI_RETRYING);
-                esp_wifi_connect();
-                s_retry_num++;
-                g_wifi_status.reconnect_attempts++;
-                ESP_LOGI(TAG, "Retry to connect to AP (attempt %d/%d)",
-                         s_retry_num, MAX_RETRY);
-            } else {
-                led_status_set_wifi(LED_STATUS_WIFI_RETRYING);
-                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-                ESP_LOGE(TAG, "Connection failed after %d attempts", MAX_RETRY);
-                vTaskDelay(pdMS_TO_TICKS(10000));
-                s_retry_num = 0;
-                esp_wifi_connect();
-            }
+            led_status_set_wifi(LED_STATUS_WIFI_RETRYING);
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-
             update_mdns_hostname(false);
+
+            // Hand off to the reconnect task. Never block the event loop.
+            if (s_reconnect_task_handle) {
+                xTaskNotifyGive(s_reconnect_task_handle);
+            }
             break;
         }
 
@@ -220,13 +227,113 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         snprintf(g_wifi_status.netmask, sizeof(g_wifi_status.netmask),
                  IPSTR, IP2STR(&event->ip_info.netmask));
 
-        s_retry_num = 0;
         g_wifi_status.connected = true;
+        s_ever_connected = true;
         led_status_set_wifi(LED_STATUS_WIFI_CONNECTED);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
 
         start_sntp_if_needed();
         update_mdns_hostname(true);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Reconnect task: owns all STA reconnect attempts with exponential backoff.
+// Driven by xTaskNotifyGive() from the disconnect handler. Runs even without
+// notifications (poll loop) so it can catch silent stalls.
+// ----------------------------------------------------------------------------
+static void wifi_reconnect_task(void *arg)
+{
+    int backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+
+    while (1) {
+        // Wake on disconnect notification OR after the current backoff window.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(backoff_ms));
+
+        if (!s_has_sta_credentials) {
+            backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+            continue;
+        }
+        if (g_wifi_status.connected) {
+            backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+            continue;
+        }
+
+        g_wifi_status.reconnect_attempts++;
+        ESP_LOGI(TAG, "Reconnect attempt #%lu (backoff was %d ms)",
+                 (unsigned long)g_wifi_status.reconnect_attempts, backoff_ms);
+
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            ESP_LOGW(TAG, "esp_wifi_connect() returned %s", esp_err_to_name(err));
+        }
+
+        backoff_ms *= 2;
+        if (backoff_ms > RECONNECT_BACKOFF_MAX_MS) {
+            backoff_ms = RECONNECT_BACKOFF_MAX_MS;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Watchdog task: detects two failure modes that the reconnect loop can't.
+//   1. Silent link loss — we still think we're connected, but the radio /
+//      router state is broken. We notice esp_wifi_sta_get_ap_info() failing
+//      and force a disconnect so the normal recovery path kicks in.
+//   2. Persistent total offline — STA hasn't come back for >10 min. Reboot.
+// Only acts once we've ever successfully connected; avoids reboot loops on
+// fresh installs where credentials may be wrong.
+// ----------------------------------------------------------------------------
+static void wifi_watchdog_task(void *arg)
+{
+    int64_t offline_since_us = 0;
+    int     ap_info_fail_count = 0;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(WATCHDOG_CHECK_INTERVAL_MS));
+
+        if (!s_has_sta_credentials) {
+            offline_since_us   = 0;
+            ap_info_fail_count = 0;
+            continue;
+        }
+
+        if (g_wifi_status.connected) {
+            offline_since_us = 0;
+
+            wifi_ap_record_t ap_info;
+            esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
+            if (err == ESP_OK) {
+                ap_info_fail_count = 0;
+            } else {
+                ap_info_fail_count++;
+                ESP_LOGW(TAG, "AP info query failed (%d/%d): %s",
+                         ap_info_fail_count, WATCHDOG_SILENT_LOSS_FAILS,
+                         esp_err_to_name(err));
+                if (ap_info_fail_count >= WATCHDOG_SILENT_LOSS_FAILS) {
+                    ESP_LOGE(TAG, "Silent link loss — forcing reconnect");
+                    ap_info_fail_count = 0;
+                    g_wifi_status.connected = false;
+                    led_status_set_wifi(LED_STATUS_WIFI_RETRYING);
+                    esp_wifi_disconnect();  // triggers normal recovery path
+                }
+            }
+        } else {
+            ap_info_fail_count = 0;
+            int64_t now_us = esp_timer_get_time();
+            if (offline_since_us == 0) {
+                offline_since_us = now_us;
+            }
+            int64_t offline_ms = (now_us - offline_since_us) / 1000;
+
+            if (s_ever_connected && offline_ms > WATCHDOG_OFFLINE_REBOOT_MS) {
+                ESP_LOGE(TAG, "Offline for >%d ms after a prior connection — rebooting",
+                         WATCHDOG_OFFLINE_REBOOT_MS);
+                vTaskDelay(pdMS_TO_TICKS(200));  // let the log line flush
+                esp_restart();
+            }
+        }
     }
 }
 
@@ -321,6 +428,27 @@ esp_err_t wifi_manager_start(const char *ssid, const char *password)
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Disable power save: aggressive PS is a common cause of silent stalls
+    // on some routers (DTIM mismatches, missed beacons). The board is mains-
+    // powered via the solar controller, so battery savings are irrelevant.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(NONE) failed: %s", esp_err_to_name(ps_err));
+    }
+
+    s_has_sta_credentials = has_sta;
+
+    // Spin up the reconnect + watchdog tasks once. They self-gate on
+    // s_has_sta_credentials, so creating them even in AP-only mode is fine.
+    if (s_reconnect_task_handle == NULL) {
+        xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, NULL, 4,
+                    &s_reconnect_task_handle);
+    }
+    if (s_watchdog_task_handle == NULL) {
+        xTaskCreate(wifi_watchdog_task, "wifi_wdog", 3072, NULL, 3,
+                    &s_watchdog_task_handle);
+    }
 
     s_ap_active              = true;
     g_wifi_status.ap_active  = true;
@@ -499,8 +627,8 @@ esp_err_t wifi_manager_set_sta_config(const char *ssid, const char *password)
         return err;
     }
 
-    s_retry_num = 0;
     g_wifi_status.connected = false;
+    s_has_sta_credentials   = true;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
     esp_wifi_connect();
@@ -510,6 +638,7 @@ esp_err_t wifi_manager_set_sta_config(const char *ssid, const char *password)
 void wifi_manager_disconnect_sta(void)
 {
     ESP_LOGI(TAG, "Disconnecting STA and clearing config");
+    s_has_sta_credentials = false;
     esp_wifi_disconnect();
 
     wifi_config_t empty = {0};
@@ -519,7 +648,6 @@ void wifi_manager_disconnect_sta(void)
     g_wifi_status.ssid[0] = '\0';
     g_wifi_status.ip[0] = '\0';
     g_wifi_status.gateway[0] = '\0';
-    s_retry_num = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
     update_mdns_hostname(false);

@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_chip_info.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "config.h"
 #include "led_status.h"
@@ -15,6 +17,62 @@
 #include "mqtt_bridge.h"
 
 static const char *TAG = "main";
+
+// Daily reboot policy.
+//   - Don't reboot in the first 5 minutes of uptime (rules out reboot loops).
+//   - If SNTP has synced (year >= 2025), reboot at the next UTC midnight.
+//   - Otherwise, fall back to a 24h-uptime trigger.
+//   - Hard cap at 25h uptime regardless — last-resort if midnight calc misfires.
+#define DAILY_REBOOT_MIN_UPTIME_MS   (5LL * 60 * 1000)
+#define DAILY_REBOOT_CHECK_PERIOD_MS (60LL * 1000)
+#define DAILY_REBOOT_UPTIME_CAP_MS   (25LL * 60 * 60 * 1000)
+#define DAILY_REBOOT_FALLBACK_MS     (24LL * 60 * 60 * 1000)
+#define DAILY_REBOOT_MIDNIGHT_WINDOW_S 60   // fire within this window past 00:00:00 UTC
+
+static void daily_reboot_task(void *arg)
+{
+    const int64_t boot_us = esp_timer_get_time();
+
+    // Don't even consider rebooting in the first few minutes.
+    vTaskDelay(pdMS_TO_TICKS(DAILY_REBOOT_MIN_UPTIME_MS));
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(DAILY_REBOOT_CHECK_PERIOD_MS));
+
+        int64_t uptime_ms = (esp_timer_get_time() - boot_us) / 1000;
+
+        // Hard cap. Catches the case where time was synced briefly then lost.
+        if (uptime_ms > DAILY_REBOOT_UPTIME_CAP_MS) {
+            ESP_LOGW(TAG, "Daily reboot: 25h uptime cap reached");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
+
+        time_t now;
+        time(&now);
+        struct tm tm_utc;
+        gmtime_r(&now, &tm_utc);
+        bool time_synced = (tm_utc.tm_year + 1900) >= 2025;
+
+        if (time_synced) {
+            int sec_into_day = tm_utc.tm_hour * 3600
+                             + tm_utc.tm_min  * 60
+                             + tm_utc.tm_sec;
+            if (sec_into_day < DAILY_REBOOT_MIDNIGHT_WINDOW_S) {
+                ESP_LOGW(TAG, "Daily reboot: hit midnight UTC (uptime %lld ms)",
+                         (long long)uptime_ms);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            }
+        } else {
+            if (uptime_ms > DAILY_REBOOT_FALLBACK_MS) {
+                ESP_LOGW(TAG, "Daily reboot: 24h uptime fallback (no time sync)");
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            }
+        }
+    }
+}
 
 static void status_broadcaster_task(void *arg)
 {
@@ -104,6 +162,9 @@ void app_main(void)
 
     // 1 Hz WebSocket push of current wind reading.
     xTaskCreate(status_broadcaster_task, "ws_status", 4096, NULL, 5, NULL);
+
+    // Daily reboot — runs in the background, gates itself on uptime/time-sync.
+    xTaskCreate(daily_reboot_task, "daily_reboot", 3072, NULL, 2, NULL);
 
     wifi_status_t wifi_status;
     wifi_manager_get_status(&wifi_status);
