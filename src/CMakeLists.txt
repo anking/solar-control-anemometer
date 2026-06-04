@@ -8,6 +8,7 @@ idf_component_register(
         "http_server.c"
         "anemometer.c"
         "mqtt_bridge.c"
+        "power_mgr.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_adc
@@ -19,6 +20,8 @@ idf_component_register(
         mqtt
         driver
         app_update
+        esp_hw_support
+        esp_timer
 )
 
 target_add_binary_data(${COMPONENT_LIB} "index.html" TEXT)

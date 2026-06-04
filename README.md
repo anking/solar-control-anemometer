@@ -5,9 +5,11 @@ or equivalent), reading a **passive DC-generator anemometer** (3-cup, 2-wire,
 0–3.8 V output proportional to rotation speed — e.g. the Jeanoko / Bordstract
 units on Amazon) and serving a live dashboard.
 
-Companion to [solar-inverter-esp32](../solar-inverter-esp32). MQTT bridge is
-scaffolded (configurable from the dashboard) but not yet wired to publish on
-every reading — that's a follow-up.
+Companion to [solar-inverter-esp32](../solar-inverter-esp32). It publishes wind
+telemetry over MQTT and is battery-aware: in **Active** mode it reports by
+exception (only on meaningful change, gusts, or a periodic heartbeat) and lets
+the WiFi radio modem-sleep in between; a **Sleep** mode deep-sleeps and wakes
+once per interval to report a summary, for when the panels are towed.
 
 ## Hardware
 
@@ -63,12 +65,68 @@ After it joins your network, the dashboard is at `http://<device-ip>/` or
   "capture zero" button.
 - **WiFi**: status, scan, connect, forget.
 - **MQTT**: broker config (saved to NVS, optional).
-- **System**: firmware version, heap, restart.
+- **System**: firmware version, heap, restart, LED behavior, **power mode**
+  (Active / Sleep + wake interval + held backlog count).
 - **Update**: upload a `.bin` over the air; writes the inactive OTA slot
   and reboots into it.
 
 Live updates push over `/ws` once per second; falls back to polling
 `/api/status` if the WebSocket drops.
+
+## Power / battery
+
+The device runs on battery, so it avoids transmitting on every reading.
+
+**Active mode** (default) keeps the dashboard live but reports to MQTT *by
+exception*: 1 Hz readings are batched and only flushed when
+
+- sustained wind moves by ≥ `REPORT_MPH_DEADBAND` (2 mph),
+- a gust jumps ≥ `REPORT_GUST_DELTA_MPH` (3 mph) above the last send (flushed
+  immediately), or
+- the batch fills, or
+- the `REPORT_HEARTBEAT_SECONDS` (15 s) heartbeat elapses.
+
+Batches land on `anemometers/<mac>/wind` as a JSON array. Between flushes the
+WiFi radio idles in `WIFI_PS_MIN_MODEM`.
+
+**Sleep mode** is a deep-sleep duty cycle for when the panels are towed and
+live wind no longer matters. Each wake it samples a `SLEEP_BURST_SECONDS`
+(30 s) burst, collapses it to one `{avg,peak,min}` summary, and publishes the
+summary plus any backlog accumulated while out of broker range to
+`anemometers/<mac>/summary` (QoS 1). The backlog (up to `SLEEP_BACKLOG_MAX`,
+192 ≈ 8 days at 1/hour) lives in RTC memory and survives deep sleep. Default
+wake interval is `SLEEP_DEFAULT_INTERVAL_S` (3600 s).
+
+In Sleep mode the dashboard is offline, so switch modes via a **retained MQTT
+command** on `anemometers/<mac>/cmd`:
+
+```jsonc
+{"mode": "active"}              // wake up, restore the dashboard (stays active)
+{"mode": "sleep"}              // enter the deep-sleep duty cycle
+{"interval": 1800}            // change the wake interval (60–65535 s)
+{"ui": true}                  // one-shot: next wake, bring the dashboard up
+                              //   for UI_MAINT_WINDOW_S, then resume sleeping
+{"ui": 600}                   // same, but for an explicit 600 s
+```
+
+**Important:** because deep sleep powers down the radio, a command can only be
+*retained* on the broker and is acted on at the **next scheduled wake** — there
+is no way to summon the device instantly mid-sleep. Two ways to reach the UI in
+Sleep mode:
+
+- `{"mode": "active"}` — reboots into Active mode permanently (UI always on)
+  until you send `{"mode": "sleep"}` again.
+- `{"ui": true}` — a one-shot **maintenance window**: the device brings the
+  dashboard up on its next wake, stays awake long enough to do an OTA update or
+  inspect, then automatically goes back to sleep. The retained command is
+  cleared once consumed so it doesn't repeat.
+
+A mode change reboots the device into the matching boot path. Persistent
+settings (mode, interval) live in NVS (`device_cfg`); the `ui` window is
+transient. Tunables live in [src/config.h](src/config.h).
+
+> **Note:** the ESP32-C3 has no ULP coprocessor, so it can't sample the ADC
+> while asleep — Sleep mode only captures wind during its brief wake burst.
 
 ## Calibration
 
@@ -114,7 +172,8 @@ src/
   nvs_store.{c,h}       # thin NVS wrapper
   led_status.{c,h}      # onboard LED state machine
   http_server.{c,h}     # /api/* + /ws
-  mqtt_bridge.{c,h}     # scaffold; publishes to anemometers/<mac>/wind
+  mqtt_bridge.{c,h}     # publishes wind/summary, subscribes to <mac>/cmd
+  power_mgr.{c,h}       # Active/Sleep modes, deep-sleep cycle, RTC backlog
   index.html            # embedded dashboard
 ```
 

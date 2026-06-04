@@ -51,6 +51,44 @@
 #define ANEMOMETER_GUST_AVG_SECONDS       3     //  3-sec gust window
 
 // =============================================================================
+// POWER / REPORTING (battery operation)
+// =============================================================================
+// The device runs on battery. Instead of pushing a reading every second, we
+// report by exception: only send when something meaningful changes, plus a
+// periodic heartbeat so the backend knows we're still alive. Between sends the
+// radio can idle in modem-sleep, which is where most of the battery savings
+// come from.
+
+// ACTIVE mode — adaptive batched reporting.
+//   Heartbeat: force a flush at least this often even if nothing changed.
+#define REPORT_HEARTBEAT_SECONDS   15
+//   Deadband: sustained-wind change (mph) that counts as "something changed".
+#define REPORT_MPH_DEADBAND        2.0f
+//   Gust trigger: an instantaneous jump (mph) above the last sent value that
+//   forces an immediate flush — we never want to sit on a gust.
+#define REPORT_GUST_DELTA_MPH      3.0f
+//   Cap on how many 1 Hz samples we batch before flushing regardless.
+#define REPORT_BATCH_MAX           20
+
+// SLEEP mode — deep-sleep duty cycle for when the panels are towed and live
+// wind data no longer matters. We wake on an interval, take a short burst of
+// samples, publish a summary (plus any backlog accumulated while offline),
+// then deep-sleep again.
+//   Default wake interval (seconds). Overridable via MQTT / NVS.
+#define SLEEP_DEFAULT_INTERVAL_S   3600
+//   How long to stay awake sampling each wake (seconds).
+#define SLEEP_BURST_SECONDS        30
+//   Max time to wait for WiFi+MQTT before giving up and re-sleeping (seconds).
+#define SLEEP_WIFI_TIMEOUT_S       25
+//   Backlog of hourly summaries kept in RTC memory if we can't reach the
+//   broker (e.g. out of range). 192 ≈ 8 days at 1/hour.
+#define SLEEP_BACKLOG_MAX          192
+//   Maintenance window: when a {"ui":true} command is picked up on wake, the
+//   device brings the dashboard up and stays awake this long (seconds) before
+//   resuming the sleep cycle — enough to do an OTA update or inspect.
+#define UI_MAINT_WINDOW_S          1800
+
+// =============================================================================
 // FIRMWARE VERSION (injected by version.py at build time)
 // =============================================================================
 

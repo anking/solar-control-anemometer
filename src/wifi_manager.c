@@ -429,12 +429,13 @@ esp_err_t wifi_manager_start(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Disable power save: aggressive PS is a common cause of silent stalls
-    // on some routers (DTIM mismatches, missed beacons). The board is mains-
-    // powered via the solar controller, so battery savings are irrelevant.
-    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    // Modem-sleep between DTIM beacons. The device runs on battery, so the
+    // radio should idle whenever it isn't sending. MIN_MODEM still wakes for
+    // every DTIM beacon, so it stays responsive and avoids the missed-beacon
+    // stalls that MAX_MODEM can cause on flaky routers.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     if (ps_err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_wifi_set_ps(NONE) failed: %s", esp_err_to_name(ps_err));
+        ESP_LOGW(TAG, "esp_wifi_set_ps(MIN_MODEM) failed: %s", esp_err_to_name(ps_err));
     }
 
     s_has_sta_credentials = has_sta;

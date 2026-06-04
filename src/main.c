@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,6 +16,7 @@
 #include "http_server.h"
 #include "anemometer.h"
 #include "mqtt_bridge.h"
+#include "power_mgr.h"
 
 static const char *TAG = "main";
 
@@ -74,9 +76,23 @@ static void daily_reboot_task(void *arg)
     }
 }
 
+// ACTIVE-mode broadcaster.
+//   - WebSocket: pushes the live reading every second (local; only transmits
+//     if a dashboard client is actually connected).
+//   - MQTT: report-by-exception. 1 Hz readings are batched and only flushed
+//     when the wind moves past the deadband, a gust spikes, the batch fills,
+//     or the heartbeat interval elapses. Between flushes the radio idles in
+//     modem-sleep, which is where the battery savings come from.
+static anemometer_reading_t s_batch[REPORT_BATCH_MAX];
+
 static void status_broadcaster_task(void *arg)
 {
-    char buf[448];
+    static char buf[448];
+    int     batch_n = 0;
+    bool    have_sent = false;
+    float   last_sent_mph = 0.0f;
+    int64_t last_flush_ms = esp_timer_get_time() / 1000;
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -106,8 +122,26 @@ static void status_broadcaster_task(void *arg)
             http_server_ws_broadcast_status(buf, (size_t)len);
         }
 
-        // Push the same reading to MQTT (no-op if not connected).
-        mqtt_bridge_publish_reading(&r);
+        if (!r.valid) continue;
+
+        if (batch_n < REPORT_BATCH_MAX) {
+            s_batch[batch_n++] = r;
+        }
+
+        int64_t now_ms    = esp_timer_get_time() / 1000;
+        bool    first     = !have_sent;
+        bool    heartbeat = (now_ms - last_flush_ms) >= (REPORT_HEARTBEAT_SECONDS * 1000);
+        bool    deadband  = have_sent && fabsf(r.wind_mph - last_sent_mph) >= REPORT_MPH_DEADBAND;
+        bool    gust      = have_sent && (r.wind_mph - last_sent_mph) >= REPORT_GUST_DELTA_MPH;
+        bool    full      = batch_n >= REPORT_BATCH_MAX;
+
+        if (first || heartbeat || deadband || gust || full) {
+            mqtt_bridge_publish_batch(s_batch, batch_n);
+            batch_n       = 0;
+            have_sent     = true;
+            last_sent_mph = r.wind_mph;
+            last_flush_ms = now_ms;
+        }
     }
 }
 
@@ -135,6 +169,9 @@ void app_main(void)
         ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(ret));
     }
 
+    // Load the power profile (ACTIVE vs SLEEP) before we decide what to start.
+    power_mgr_init();
+
     // LED first so we can show WiFi state during init.
     ret = led_status_init();
     if (ret != ESP_OK) ESP_LOGE(TAG, "LED init failed: %s", esp_err_to_name(ret));
@@ -157,14 +194,21 @@ void app_main(void)
         wifi_manager_start("", "");
     }
 
+    // MQTT (needed in both modes — also delivers the retained power command).
+    mqtt_bridge_init();
+
+    // SLEEP mode: skip the dashboard and live telemetry. Sample a burst,
+    // flush the backlog, and deep-sleep. This call never returns.
+    if (power_mgr_get_mode() == POWER_MODE_SLEEP) {
+        ESP_LOGW(TAG, "Booting in SLEEP mode");
+        power_mgr_run_sleep_cycle();
+    }
+
     // HTTP server (dashboard + APIs + /ws).
     ret = http_server_start();
     if (ret != ESP_OK) ESP_LOGE(TAG, "HTTP server failed: %s", esp_err_to_name(ret));
 
-    // MQTT scaffold (only starts if a host was previously saved).
-    mqtt_bridge_init();
-
-    // 1 Hz WebSocket push of current wind reading.
+    // 1 Hz WebSocket push + report-by-exception MQTT batching.
     xTaskCreate(status_broadcaster_task, "ws_status", 4096, NULL, 5, NULL);
 
     // Daily reboot — runs in the background, gates itself on uptime/time-sync.

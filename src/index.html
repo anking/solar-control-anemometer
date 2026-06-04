@@ -254,6 +254,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       <button class="btn" data-mode="debug">Debug</button>
     </div>
   </div>
+
+  <div class="card">
+    <div class="card-title">Power mode</div>
+    <p class="muted" style="margin-bottom:10px">
+      <b>Active</b>: stays awake, reports wind by exception (only on change, gust, or a 15s heartbeat) to save battery.
+      <b>Sleep</b>: deep-sleeps and wakes once per interval to report a summary — for when the panels are towed and live wind doesn't matter. Switching reboots the device. While in Sleep, the dashboard is offline; switch back via MQTT.
+    </p>
+    <div class="btn-row" id="power-modes">
+      <button class="btn" data-mode="active">Active</button>
+      <button class="btn" data-mode="sleep">Sleep</button>
+    </div>
+    <div class="metric" style="margin-top:10px">
+      <span class="metric-label">Wake interval</span>
+      <span class="metric-value">
+        <input id="sleep-interval" type="number" min="60" max="65535" step="60"
+               style="width:90px" /> <span class="metric-unit">s</span>
+        <button class="btn" style="margin-left:6px" onclick="saveInterval()">Set</button>
+      </span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Backlog (held)</span>
+      <span class="metric-value"><span id="power-backlog">--</span></span>
+    </div>
+  </div>
 </div>
 
 <!-- UPDATE PAGE -->
@@ -552,7 +576,58 @@ async function refreshSystem() {
     $('sensor-gpio').textContent = 'GPIO ' + s.sensor_gpio;
   } catch(e) {}
   refreshLed();
+  refreshPower();
 }
+
+async function refreshPower() {
+  try {
+    const r = await fetch('/api/power');
+    if (!r.ok) return;
+    const s = await r.json();
+    document.querySelectorAll('#power-modes .btn').forEach(b => {
+      b.classList.toggle('btn-primary', b.dataset.mode === s.mode);
+    });
+    const iv = $('sleep-interval');
+    if (document.activeElement !== iv) iv.value = s.sleep_interval_s;
+    $('power-backlog').textContent = s.backlog;
+  } catch(e) {}
+}
+
+async function setPowerMode(mode) {
+  if (mode === 'sleep' &&
+      !confirm('Enter sleep mode? The device will deep-sleep and the dashboard will go offline. Switch back via MQTT.')) {
+    refreshPower();
+    return;
+  }
+  try {
+    const r = await fetch('/api/power', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode})
+    });
+    if (r.ok) {
+      const s = await r.json();
+      toast(s.rebooting ? 'Switching to ' + mode + '… rebooting' : 'Power mode: ' + mode, 'success');
+      if (!s.rebooting) refreshPower();
+    } else toast('Save failed', 'error');
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+async function saveInterval() {
+  const v = parseInt($('sleep-interval').value, 10);
+  if (!(v >= 60 && v <= 65535)) { toast('Interval must be 60–65535s', 'error'); return; }
+  try {
+    const r = await fetch('/api/power', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({interval: v})
+    });
+    if (r.ok) { toast('Wake interval saved', 'success'); refreshPower(); }
+    else toast('Save failed', 'error');
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+document.querySelectorAll('#power-modes .btn').forEach(b => {
+  b.onclick = () => setPowerMode(b.dataset.mode);
+});
 
 async function refreshLed() {
   try {

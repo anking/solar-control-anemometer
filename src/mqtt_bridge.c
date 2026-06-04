@@ -1,6 +1,8 @@
 #include "mqtt_bridge.h"
 #include "nvs_store.h"
 #include "config.h"
+#include "power_mgr.h"
+#include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_app_desc.h"
@@ -61,8 +63,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         snprintf(topic, sizeof(topic), "anemometers/%s/status", s_mac_str);
         esp_mqtt_client_publish(s_client, topic, "{\"online\":true}", 0, 1, 1);
 
+        // Subscribe to the retained command topic so power-mode changes are
+        // delivered the moment we connect (including after a deep-sleep wake).
+        snprintf(topic, sizeof(topic), "anemometers/%s/cmd", s_mac_str);
+        esp_mqtt_client_subscribe(s_client, topic, 1);
+
         // Publish device info so the cloud can identify model/firmware/calibration.
         mqtt_bridge_publish_info();
+        break;
+    }
+    case MQTT_EVENT_DATA: {
+        // Only the command topic carries inbound messages; route any to the
+        // power manager, which decides whether to persist/reboot.
+        if (event->topic_len >= 4 &&
+            memcmp(event->topic + event->topic_len - 4, "/cmd", 4) == 0) {
+            power_mgr_handle_command(event->data, event->data_len);
+        }
         break;
     }
     case MQTT_EVENT_DISCONNECTED:
@@ -161,13 +177,34 @@ void mqtt_bridge_publish_info(void)
 
     const char *fw = esp_app_get_description()->version;
 
-    char buf[256];
+    // Power state (published here, not in every wind packet — it changes rarely
+    // and only matters for the dashboard's mode/next-wake display). The cloud
+    // computes the next wake as (info-received-time + sleep_interval_s) since a
+    // sleeping device only reconnects to publish this at the start of each wake.
+    power_mode_t mode = power_mgr_get_mode();
+    const char *mode_str = (mode == POWER_MODE_SLEEP) ? "sleep" : "active";
+
+    // Deep-link targets for the on-device UI. ui_url uses the current IP because
+    // mDNS (.local) does not resolve reliably off-LAN or on some clients (e.g.
+    // Windows), so the IP is the dependable clickable link. It is refreshed on
+    // every connect/wake, so a DHCP change is picked up next cycle. ui_host
+    // carries the stable mDNS name (e.g. "anemometer-8dabd4.local") for display
+    // and for clients on a LAN where mDNS does resolve.
+    wifi_status_t wifi;
+    wifi_manager_get_status(&wifi);
+
+    char buf[384];
     int len = snprintf(buf, sizeof(buf),
         "{\"model\":\"esp32-c3-anemometer\",\"firmware\":\"%s\","
         "\"sensor_gpio\":%d,"
-        "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d}",
+        "\"mph_per_volt\":%.2f,\"zero_offset_mv\":%d,"
+        "\"power_mode\":\"%s\",\"sleep_interval_s\":%u,\"backlog\":%u,"
+        "\"ui_url\":\"http://%s/\",\"ui_host\":\"%s.local\"}",
         fw, ANEMOMETER_GPIO,
-        r.mph_per_volt, r.zero_offset_mv);
+        r.mph_per_volt, r.zero_offset_mv,
+        mode_str, (unsigned)power_mgr_get_sleep_interval_s(),
+        (unsigned)power_mgr_backlog_count(),
+        wifi.ip, wifi.hostname);
 
     int msg_id = esp_mqtt_client_publish(s_client, topic, buf, len, 1, 1);
     if (msg_id >= 0) {
@@ -208,6 +245,80 @@ void mqtt_bridge_publish_reading(const anemometer_reading_t *r)
         s_publish_fail_count++;
         ESP_LOGW(TAG, "Publish failed (fails=%lu)", (unsigned long)s_publish_fail_count);
     }
+}
+
+void mqtt_bridge_publish_batch(const anemometer_reading_t *arr, size_t n)
+{
+    if (!s_connected || !s_client || !arr || n == 0) return;
+
+    char topic[64];
+    snprintf(topic, sizeof(topic), "anemometers/%s/wind", s_mac_str);
+
+    // Static to keep this large buffer off the caller's task stack.
+    static char buf[2560];
+    int len = 0;
+    len += snprintf(buf + len, sizeof(buf) - len, "[");
+    for (size_t i = 0; i < n; i++) {
+        const anemometer_reading_t *r = &arr[i];
+        int w = snprintf(buf + len, sizeof(buf) - len,
+            "%s{\"voltage_v\":%.3f,\"mph\":%.2f,\"kmh\":%.2f,"
+            "\"mph_2min\":%.2f,\"gust_mph\":%.2f,\"saturated\":%s}",
+            i ? "," : "",
+            r->voltage_v, r->wind_mph, r->wind_kmh,
+            r->wind_mph_2min, r->gust_mph,
+            r->saturated ? "true" : "false");
+        if (w <= 0 || len + w >= (int)sizeof(buf) - 2) break;  // leave room for "]"
+        len += w;
+    }
+    len += snprintf(buf + len, sizeof(buf) - len, "]");
+
+    int msg_id = esp_mqtt_client_publish(s_client, topic, buf, len, 0, 0);
+    if (msg_id >= 0) {
+        s_publish_count++;
+    } else {
+        s_publish_fail_count++;
+        ESP_LOGW(TAG, "Batch publish failed (fails=%lu)", (unsigned long)s_publish_fail_count);
+    }
+}
+
+void mqtt_bridge_publish_summaries(const wind_summary_t *arr, size_t n)
+{
+    if (!s_connected || !s_client || !arr || n == 0) return;
+
+    char topic[64];
+    snprintf(topic, sizeof(topic), "anemometers/%s/summary", s_mac_str);
+
+    static char buf[3072];
+    int len = 0;
+    len += snprintf(buf + len, sizeof(buf) - len, "[");
+    for (size_t i = 0; i < n; i++) {
+        const wind_summary_t *s = &arr[i];
+        int w = snprintf(buf + len, sizeof(buf) - len,
+            "%s{\"t\":%lu,\"avg_mph\":%.2f,\"peak_mph\":%.2f,\"min_mph\":%.2f}",
+            i ? "," : "",
+            (unsigned long)s->epoch, s->avg_mph, s->peak_mph, s->min_mph);
+        if (w <= 0 || len + w >= (int)sizeof(buf) - 2) break;
+        len += w;
+    }
+    len += snprintf(buf + len, sizeof(buf) - len, "]");
+
+    // QoS 1 — backlog delivery matters; we only clear it on success.
+    int msg_id = esp_mqtt_client_publish(s_client, topic, buf, len, 1, 0);
+    if (msg_id >= 0) {
+        s_publish_count++;
+    } else {
+        s_publish_fail_count++;
+        ESP_LOGW(TAG, "Summary publish failed (fails=%lu)", (unsigned long)s_publish_fail_count);
+    }
+}
+
+void mqtt_bridge_clear_retained_cmd(void)
+{
+    if (!s_connected || !s_client) return;
+    char topic[64];
+    snprintf(topic, sizeof(topic), "anemometers/%s/cmd", s_mac_str);
+    // Zero-length retained message deletes the retained value on the broker.
+    esp_mqtt_client_publish(s_client, topic, "", 0, 1, 1);
 }
 
 esp_err_t mqtt_bridge_configure(const char *host, int port, const char *user, const char *pass)

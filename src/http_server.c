@@ -12,6 +12,7 @@
 #include "wifi_config.h"
 #include "anemometer.h"
 #include "mqtt_bridge.h"
+#include "power_mgr.h"
 #include "led_status.h"
 #include "config.h"
 #include "freertos/FreeRTOS.h"
@@ -367,6 +368,62 @@ static esp_err_t api_capture_zero_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, resp);
 }
 
+// ---- Power mode -------------------------------------------------------------
+
+static esp_err_t api_power_get_handler(httpd_req_t *req)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "{\"mode\":\"%s\",\"sleep_interval_s\":%u,\"backlog\":%u}",
+        power_mgr_get_mode() == POWER_MODE_SLEEP ? "sleep" : "active",
+        (unsigned)power_mgr_get_sleep_interval_s(),
+        (unsigned)power_mgr_backlog_count());
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t api_power_post_handler(httpd_req_t *req)
+{
+    char body[128] = {0};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body"); return ESP_FAIL; }
+
+    // Optional: sleep interval (takes effect on the next sleep cycle).
+    int interval = json_extract_int(body, "interval", -1);
+    if (interval >= 60 && interval <= 65535) {
+        power_mgr_set_sleep_interval_s((uint16_t)interval);
+    }
+
+    // Optional: power mode. Switching mode requires a reboot to take effect,
+    // since each mode has a distinct boot path.
+    bool reboot = false;
+    char mode_str[16] = {0};
+    if (json_extract_str(body, "mode", mode_str, sizeof(mode_str))) {
+        power_mode_t target = power_mgr_get_mode();
+        if (strcmp(mode_str, "sleep") == 0)       target = POWER_MODE_SLEEP;
+        else if (strcmp(mode_str, "active") == 0) target = POWER_MODE_ACTIVE;
+        if (target != power_mgr_get_mode()) {
+            power_mgr_set_mode(target);
+            reboot = true;
+        }
+    }
+
+    char resp[128];
+    snprintf(resp, sizeof(resp),
+        "{\"mode\":\"%s\",\"sleep_interval_s\":%u,\"rebooting\":%s}",
+        power_mgr_get_mode() == POWER_MODE_SLEEP ? "sleep" : "active",
+        (unsigned)power_mgr_get_sleep_interval_s(),
+        reboot ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+
+    if (reboot) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
+    return ESP_OK;
+}
+
 // ---- MQTT -------------------------------------------------------------------
 
 static esp_err_t api_mqtt_get_handler(httpd_req_t *req)
@@ -624,7 +681,7 @@ esp_err_t http_server_start(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 24;
     config.max_open_sockets = 5;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
@@ -651,6 +708,8 @@ esp_err_t http_server_start(void)
         { .uri = "/api/mqtt",             .method = HTTP_DELETE, .handler = api_mqtt_delete_handler },
         { .uri = "/api/led",              .method = HTTP_GET,    .handler = api_led_get_handler },
         { .uri = "/api/led",              .method = HTTP_POST,   .handler = api_led_post_handler },
+        { .uri = "/api/power",            .method = HTTP_GET,    .handler = api_power_get_handler },
+        { .uri = "/api/power",            .method = HTTP_POST,   .handler = api_power_post_handler },
         { .uri = "/api/restart",          .method = HTTP_POST,   .handler = api_restart_handler },
         { .uri = "/api/ota",              .method = HTTP_POST,   .handler = api_ota_handler },
     };
