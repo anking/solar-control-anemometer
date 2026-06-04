@@ -63,6 +63,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .preset:hover{border-color:var(--accent);color:var(--text)}
 .muted{color:var(--dim);font-size:12px}
 .stale{opacity:.4}
+.progress{margin-top:12px;height:10px;border-radius:5px;background:var(--surface2);overflow:hidden;display:none}
+.progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--blue));transition:width .15s}
+.file-drop{border:1px dashed var(--surface2);border-radius:8px;padding:18px;text-align:center;color:var(--dim);font-size:13px}
+.file-name{margin-top:8px;font-size:13px;color:var(--text);word-break:break-all}
 </style>
 </head>
 <body>
@@ -78,6 +82,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   <div class="tab" data-page="wifi">WiFi</div>
   <div class="tab" data-page="mqtt">MQTT</div>
   <div class="tab" data-page="system">System</div>
+  <div class="tab" data-page="update">Update</div>
 </div>
 
 <!-- WIND PAGE -->
@@ -228,6 +233,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     <div class="metric"><span class="metric-label">Firmware</span><span class="metric-value" id="sys-fw">--</span></div>
     <div class="metric"><span class="metric-label">Git hash</span><span class="metric-value" id="sys-git" style="font-family:monospace;font-size:12px">--</span></div>
     <div class="metric"><span class="metric-label">IDF version</span><span class="metric-value" id="sys-idf" style="font-family:monospace;font-size:12px">--</span></div>
+    <div class="metric"><span class="metric-label">Built</span><span class="metric-value" id="sys-built" style="font-size:12px">--</span></div>
     <div class="metric"><span class="metric-label">Board</span><span class="metric-value" id="sys-board">--</span></div>
     <div class="metric"><span class="metric-label">Free heap</span><span class="metric-value"><span id="sys-heap">--</span><span class="metric-unit">B</span></span></div>
     <div class="metric"><span class="metric-label">Min free heap</span><span class="metric-value"><span id="sys-heap-min">--</span><span class="metric-unit">B</span></span></div>
@@ -246,6 +252,40 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
       <button class="btn" data-mode="errors">Errors only</button>
       <button class="btn" data-mode="off">Off</button>
       <button class="btn" data-mode="debug">Debug</button>
+    </div>
+  </div>
+</div>
+
+<!-- UPDATE PAGE -->
+<div class="page" id="page-update">
+  <div class="card">
+    <div class="card-title">Firmware update (OTA)</div>
+    <div class="metric" style="margin-bottom:4px">
+      <span class="metric-label">Running firmware</span>
+      <span class="metric-value"><span id="ota-current">--</span>
+        <span class="metric-unit" id="ota-current-git" style="font-family:monospace"></span></span>
+    </div>
+    <div class="metric" style="margin-bottom:12px">
+      <span class="metric-label">Built</span>
+      <span class="metric-value" id="ota-current-built" style="font-size:12px">--</span>
+    </div>
+    <p class="muted" style="margin-bottom:12px">
+      Upload a compiled firmware image (<code>.bin</code> — built with
+      <code>pio run</code>, found under <code>.pio/build/&lt;env&gt;/firmware.bin</code>).
+      The device writes it to the inactive slot, then reboots into the new
+      image. Don't power off during the upload.
+    </p>
+    <div class="field">
+      <label>Firmware image</label>
+      <div class="file-drop">
+        <input type="file" id="ota-file" accept=".bin,application/octet-stream">
+        <div class="file-name" id="ota-file-name"></div>
+      </div>
+    </div>
+    <div class="progress" id="ota-progress"><div class="progress-bar" id="ota-bar"></div></div>
+    <div class="muted" id="ota-status" style="margin-top:8px"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="ota-upload-btn" onclick="uploadFirmware()">Upload &amp; restart</button>
     </div>
   </div>
 </div>
@@ -276,6 +316,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.page === 'wifi') refreshWifi();
     if (tab.dataset.page === 'mqtt') refreshMqtt();
     if (tab.dataset.page === 'system') refreshSystem();
+    if (tab.dataset.page === 'update') refreshUpdate();
   };
 });
 
@@ -504,6 +545,7 @@ async function refreshSystem() {
     $('sys-fw').textContent = s.firmware_version;
     $('sys-git').textContent = s.git_hash;
     $('sys-idf').textContent = s.idf_version;
+    $('sys-built').textContent = (s.build_date && s.build_time) ? `${s.build_date} ${s.build_time}` : '—';
     $('sys-board').textContent = s.board;
     $('sys-heap').textContent = s.free_heap.toLocaleString();
     $('sys-heap-min').textContent = s.min_free_heap.toLocaleString();
@@ -544,6 +586,98 @@ async function restartDevice() {
     await fetch('/api/restart', {method:'POST'});
     toast('Restarting…', 'success');
   } catch(e) { toast('Restart failed', 'error'); }
+}
+
+// OTA firmware update
+async function refreshUpdate() {
+  try {
+    const r = await fetch('/api/system');
+    if (!r.ok) return;
+    const s = await r.json();
+    $('ota-current').textContent = s.firmware_version;
+    $('ota-current-git').textContent = s.git_hash;
+    $('ota-current-built').textContent = (s.build_date && s.build_time) ? `${s.build_date} ${s.build_time}` : '—';
+  } catch(e) {}
+}
+
+// Read the descriptor embedded in an ESP32 app image (esp_app_desc_t).
+// Layout: esp_image_header_t (24 B) + esp_image_segment_header_t (8 B) =>
+// esp_app_desc_t at file offset 32; within it: magic@+0 (0xABCD5432),
+// version[32]@+16, time[16]@+80, date[16]@+96.
+async function readBinInfo(file) {
+  try {
+    const buf = new Uint8Array(await file.slice(0, 144).arrayBuffer());
+    if (new DataView(buf.buffer).getUint32(32, true) !== 0xABCD5432) return null;
+    const str = (off, len) => {
+      let s = '';
+      for (let i = off; i < off + len && buf[i]; i++) s += String.fromCharCode(buf[i]);
+      return s;
+    };
+    return { version: str(48, 32), time: str(112, 16), date: str(128, 16) };
+  } catch(e) { return {}; }
+}
+
+$('ota-file').onchange = async () => {
+  const f = $('ota-file').files[0];
+  if (!f) { $('ota-file-name').textContent = ''; return; }
+  let info = `${f.name} (${(f.size / 1024).toFixed(0)} KB)`;
+  const inf = await readBinInfo(f);
+  if (inf === null) {
+    info += ' — ⚠ not a valid ESP32 firmware image';
+  } else if (inf.version) {
+    info += ` — v${inf.version}` + (inf.date ? ` (built ${inf.date} ${inf.time})` : '');
+  }
+  $('ota-file-name').textContent = info;
+};
+
+function uploadFirmware() {
+  const f = $('ota-file').files[0];
+  if (!f) { toast('Choose a .bin file first', 'error'); return; }
+  if (!confirm(`Flash "${f.name}" and restart the device?`)) return;
+
+  const btn = $('ota-upload-btn');
+  const bar = $('ota-bar');
+  const prog = $('ota-progress');
+  btn.disabled = true;
+  prog.style.display = 'block';
+  bar.style.width = '0%';
+  $('ota-status').textContent = 'Uploading…';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota');
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) {
+      const pct = Math.round(e.loaded / e.total * 100);
+      bar.style.width = pct + '%';
+      $('ota-status').textContent = `Uploading… ${pct}%`;
+    }
+  };
+  xhr.onload = () => {
+    btn.disabled = false;
+    if (xhr.status === 200) {
+      bar.style.width = '100%';
+      let r = {};
+      try { r = JSON.parse(xhr.responseText); } catch(e) {}
+      const ver = r.version || '';
+      const built = (r.build_date && r.build_time) ? ` (built ${r.build_date} ${r.build_time})` : '';
+      $('ota-status').textContent = (ver ? `Flashed v${ver}${built}. ` : '') +
+        'Device is rebooting into the new firmware. Reconnecting…';
+      toast(ver ? `Flashed v${ver}, rebooting` : 'Firmware flashed, rebooting', 'success');
+      setTimeout(() => location.reload(), 12000);
+    } else {
+      let msg = 'Update failed';
+      try { msg = JSON.parse(xhr.responseText).error || msg; } catch(e) { if (xhr.responseText) msg = xhr.responseText; }
+      $('ota-status').textContent = msg;
+      toast(msg, 'error');
+    }
+  };
+  xhr.onerror = () => {
+    btn.disabled = false;
+    $('ota-status').textContent = 'Upload failed (connection lost)';
+    toast('Upload failed', 'error');
+  };
+  xhr.send(f);
 }
 
 // Boot

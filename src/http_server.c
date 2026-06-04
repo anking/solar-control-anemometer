@@ -2,9 +2,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/param.h>
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "wifi_manager.h"
 #include "wifi_config.h"
 #include "anemometer.h"
@@ -254,12 +257,15 @@ static esp_err_t wifi_status_handler(httpd_req_t *req)
 
 static esp_err_t system_info_handler(httpd_req_t *req)
 {
-    char buf[384];
+    const esp_app_desc_t *app = esp_app_get_description();
+    char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"firmware_version\":\"%s\",\"git_hash\":\"%s\",\"idf_version\":\"%s\","
+        "\"build_date\":\"%s\",\"build_time\":\"%s\","
         "\"free_heap\":%lu,\"min_free_heap\":%lu,"
         "\"board\":\"esp32-c3-supermini\",\"sensor_gpio\":%d}",
         FIRMWARE_VERSION, GIT_HASH, esp_get_idf_version(),
+        app->date, app->time,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
         ANEMOMETER_GPIO);
@@ -480,6 +486,110 @@ static esp_err_t api_restart_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ---- OTA firmware update ----------------------------------------------------
+
+#define OTA_RECV_BUF_SIZE 1024
+
+static esp_err_t api_ota_handler(httpd_req_t *req)
+{
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "OTA: no update partition (single-app build?)");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: receiving %d bytes into '%s' @ 0x%08lx",
+             req->content_len, update_partition->label,
+             (unsigned long)update_partition->address);
+
+    if (req->content_len > 0 && (size_t)req->content_len > update_partition->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image larger than partition");
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(OTA_RECV_BUF_SIZE);
+    if (!buf) {
+        esp_ota_abort(ota_handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    int remaining = req->content_len;
+    int total = 0;
+    while (remaining > 0) {
+        int received = httpd_req_recv(req, buf, MIN(remaining, OTA_RECV_BUF_SIZE));
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (received <= 0) {
+            ESP_LOGE(TAG, "OTA: recv failed at %d bytes", total);
+            free(buf);
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(ota_handle, buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+            free(buf);
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write failed");
+            return ESP_FAIL;
+        }
+        total += received;
+        remaining -= received;
+    }
+    free(buf);
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        if (err == ESP_ERR_OTA_VALIDATE_FAILED)
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image validation failed (not a valid firmware)");
+        else
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_end failed");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not set boot partition");
+        return ESP_FAIL;
+    }
+
+    // Read the version + build stamp embedded in the image we just flashed so
+    // the UI can confirm exactly what's about to boot.
+    char new_ver[32] = "unknown";
+    char new_date[16] = "", new_time[16] = "";
+    esp_app_desc_t new_desc;
+    if (esp_ota_get_partition_description(update_partition, &new_desc) == ESP_OK) {
+        snprintf(new_ver, sizeof(new_ver), "%.31s", new_desc.version);
+        snprintf(new_date, sizeof(new_date), "%.15s", new_desc.date);
+        snprintf(new_time, sizeof(new_time), "%.15s", new_desc.time);
+    }
+
+    ESP_LOGI(TAG, "OTA: %d bytes written, new firmware v%s (%s %s), booting '%s' after restart",
+             total, new_ver, new_date, new_time, update_partition->label);
+    char resp[256];
+    snprintf(resp, sizeof(resp),
+        "{\"status\":\"ok\",\"version\":\"%s\",\"running\":\"%s\","
+        "\"build_date\":\"%s\",\"build_time\":\"%s\","
+        "\"message\":\"Update applied, restarting...\"}",
+        new_ver, FIRMWARE_VERSION, new_date, new_time);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 // ---- WebSocket --------------------------------------------------------------
 
 static esp_err_t ws_status_handler(httpd_req_t *req)
@@ -542,6 +652,7 @@ esp_err_t http_server_start(void)
         { .uri = "/api/led",              .method = HTTP_GET,    .handler = api_led_get_handler },
         { .uri = "/api/led",              .method = HTTP_POST,   .handler = api_led_post_handler },
         { .uri = "/api/restart",          .method = HTTP_POST,   .handler = api_restart_handler },
+        { .uri = "/api/ota",              .method = HTTP_POST,   .handler = api_ota_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         httpd_register_uri_handler(server_handle, &routes[i]);

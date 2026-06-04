@@ -11,6 +11,7 @@ Injects -DFIRMWARE_VERSION='"X.Y.Z"' into build flags.
 
 import subprocess
 import re
+import os
 
 Import("env")
 
@@ -45,6 +46,23 @@ def get_version():
 
 version = get_version()
 
+# Optional, git-ignored local suffix (e.g. "alpha1", "rc2", "dev"). Lets you
+# stamp distinct versions without committing anything: edit version_suffix.txt,
+# rebuild, and the suffix flows into FIRMWARE_VERSION, the app descriptor, the
+# UI, and the firmware-<version>.bin filename. Empty/missing file => no suffix.
+try:
+    _suffix = open(
+        os.path.join(env["PROJECT_DIR"], "version_suffix.txt")
+    ).read().strip()
+except (FileNotFoundError, OSError):
+    _suffix = ""
+if _suffix:
+    # Prepend a '-' separator unless the file already starts with one (-, +, .).
+    sep = "" if _suffix[0] in "-+." else "-"
+    version = "%s%s%s" % (version, sep, _suffix)
+    if len(version) > 31:
+        print("WARNING: version '%s' exceeds 31 chars; app descriptor will truncate it" % version)
+
 try:
     git_hash = subprocess.run(
         ["git", "describe", "--always", "--dirty"],
@@ -59,8 +77,21 @@ env.Append(CPPDEFINES=[
     ("GIT_HASH", f'\\"{git_hash}\\"'),
 ])
 
-import os
 import glob
+import shutil
+
+
+# Emit a version-stamped copy of the image (firmware-X.Y.Z.bin) alongside the
+# default firmware.bin, so the file you download to flash over OTA is
+# self-identifying. firmware.bin is left intact for `pio run -t upload`.
+def _versioned_copy(source, target, env):
+    src = str(target[0])
+    dst = os.path.join(os.path.dirname(src), "firmware-%s.bin" % version)
+    shutil.copyfile(src, dst)
+    print("Versioned firmware image: %s" % dst)
+
+
+env.AddPostAction("$BUILD_DIR/${PROGNAME}.bin", _versioned_copy)
 
 vfile = os.path.join(env["PROJECT_DIR"], "version.txt")
 try:

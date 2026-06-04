@@ -64,6 +64,8 @@ After it joins your network, the dashboard is at `http://<device-ip>/` or
 - **WiFi**: status, scan, connect, forget.
 - **MQTT**: broker config (saved to NVS, optional).
 - **System**: firmware version, heap, restart.
+- **Update**: upload a `.bin` over the air; writes the inactive OTA slot
+  and reboots into it.
 
 Live updates push over `/ws` once per second; falls back to polling
 `/api/status` if the WebSocket drops.
@@ -98,7 +100,7 @@ You can also tweak the numbers freely and watch the live reading change.
 
 ```
 platformio.ini          # board = esp32-c3-devkitm-1, framework = espidf
-partitions.csv          # 4 MB single-app layout (no OTA yet)
+partitions.csv          # 4 MB dual-OTA layout (ota_0/ota_1 + otadata)
 sdkconfig.defaults      # USB-Serial-JTAG console, WS support
 version.py              # SemVer derived from conventional commits
 CMakeLists.txt          # project root
